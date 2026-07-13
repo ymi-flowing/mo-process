@@ -55,6 +55,29 @@ Success → `examples/result-success.json`. Error → `examples/result-error.jso
 
 `examples/n8n-email-builder.js` is a Code node that turns the run result into an SNS-branded HTML summary email (uses the tokens in `C:\Users\ymosh\Claude\ROI\email-guidelines.md`). It renders: status pill, resident block (name/unit/property/email + Open-in-ResMan link), charges list, reconciliation totals, forwarding address (with source), resident-email step result, and — when populated — the Docupost letter block. Downstream: pipe `htmlEmail` into a Gmail / SMTP node.
 
+### Importable n8n workflow
+
+`examples/n8n-workflow.json` — a ready-to-import 6-node workflow: `Fillout Webhook → Transform Payload → Dispatch GH Actions → Wait for Runner Callback → Build Email HTML → Gmail Send`. The transform node maps Fillout's `charges[]` (`description`, `finalAmount`) into the runner's `{description, amount}` shape and pulls `$execution.resumeUrl` for the callback. **After import, wire up two credentials:**
+
+- **HTTP Header Auth** for `Dispatch GH Actions` — `Authorization: Bearer <GitHub PAT with 'workflow' scope>`.
+- **Gmail OAuth2** for `Gmail Send` — signed in as the mailbox you want the summary from.
+
+The Fillout webhook payload we tested with:
+```json
+{
+  "processId": "5",
+  "residentUrl": "https://sns.myresman.com/#/Residents/Detail/<leaseId>",
+  "status": "Submitted",
+  "reviewedBy": "assistant@snsmgmt.com",
+  "managerNotes": "",
+  "charges": [
+    { "description": "Cleaning",        "originalAmount": 150, "finalAmount": 150, "adjustmentReason": "" },
+    { "description": "Carpet Cleaning", "originalAmount": 200, "finalAmount": 200, "adjustmentReason": "" }
+  ]
+}
+```
+The transform node uses `finalAmount` as `amount` (falling back to `originalAmount` when null) and defaults each charge's category to `Cleaning/Damage Charges` unless the Fillout item includes an explicit `category`.
+
 ### Payload
 ```json
 {
