@@ -2,6 +2,24 @@
 
 Automates closing out a former resident's Final Account Statement in ResMan and generating the FL statutory Notice of Intention to Impose Claim on Security Deposit (Fla. Stat. § 83.49(3)).
 
+## Status
+
+End-to-end validated via Fillout → n8n → GitHub Actions on **Sheri Kovalik / unit 1905** (run [`29292682613`](https://github.com/ymi-flowing/mo-process/actions/runs/29292682613)):
+
+- MOR approved (4 charges, deposit applied, correct balance).
+- Merged PDF (`Move Out Docs - Unit 1905.pdf`) uploaded to ResMan's Documents accordion.
+- Resident email fired from the property mailbox with the merged PDF attached — visible in ResMan's Communication Log as an `Email` row.
+- Docupost certified letter queued: `letter_id 1783984849122x717523225467440900`, $12.63.
+- Summary email to your inbox rendered the SNS-branded HTML with all sections populated (resident, charges, totals, forwarding, email step, Docupost).
+
+### Verifying an email actually sent
+
+**Gotcha:** ResMan's Communication Log is a Kendo grid inside an accordion, and its rows lazy-hydrate AFTER the accordion opens. If you scan the DOM immediately after clicking the accordion, you'll see stale rows (or none) and think the email didn't go. To verify:
+1. Deep-link with `?open=Communication%20Log` on the resident detail URL, **or**
+2. Click the Comm Log accordion and wait 3–5 seconds before scanning.
+
+The sent email shows as `<date> | <resident> | <Property> - Move-Out Documents | Email`. It also appears (with more delay) as a PDF under `Documents → Email Communication`.
+
 ## Input
 - Resident URL (e.g. `https://sns.myresman.com/#/Residents/Detail/<leaseId>`)
 - List of move-out charges: `{ description, amount }` (default category: `Cleaning/Damage Charges`)
