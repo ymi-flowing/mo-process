@@ -104,6 +104,45 @@ See `Cardentials.txt` — ResMan web login (SNS_Assistant) + Partners API keys.
   - `Final Account Statement <date> - <resident>.pdf` — downloaded auto-generated FAS.
   - `Combined - <resident>.pdf` — merged Claim Form + FAS (single PDF used for mailing).
 
+## Merging Claim Form + FAS into one PDF
+```python
+from docx2pdf import convert       # requires MS Word installed
+from pypdf import PdfWriter, PdfReader
+
+convert(str(claim_form_docx))       # writes <name>.pdf beside the docx
+w = PdfWriter()
+for src in [claim_form_pdf, fas_pdf]:
+    for page in PdfReader(str(src)).pages:
+        w.add_page(page)
+w.write(str(combined_pdf))
+```
+Order matters: Claim Form is page 1, FAS follows. The combined PDF is what gets mailed by Docupost.
+
+## Certified mail via Docupost
+Endpoint: `POST https://app.docupost.com/api/1.1/wf/sendletter` — **params go in the query string, not the body.**
+
+Minimum working params (from live testing):
+
+```
+api_token, pdf, class=usps_first_class, servicelevel=certified,
+from_name, from_address1, from_city, from_state, from_zip,
+to_name,   to_address1,   to_city,   to_state,   to_zip
+color=false, doublesided=false, description=<internal ≤40 chars>
+```
+
+Notes learned the hard way:
+- `servicelevel=certified` **requires** `class=usps_first_class`. Using `usps_standard` with `certified` silently ignores the certified request.
+- `pdf` must be a **publicly reachable URL** (no multipart/base64). Docupost's fetcher couldn't reach `catbox.moe` or `tmpfiles.org` — GitHub raw on a public repo works reliably.
+- Response: `{ "status": "Successfully queued. Cost: $X.XX ...", "letter_id": "<id>", "cost": <number> }`. Save `letter_id` — that's how you cancel or track the letter in Docupost's dashboard.
+- Docs say: "cancel any test letters within an hour to avoid being billed or having the mailpiece sent" — do this at https://docupost.com/letters.
+- Cost for a 3-page certified B&W single-sided letter: **~$12.33**.
+
+### Hosting the Combined PDF for Docupost
+Docupost fetches the PDF over the public internet. Options tried:
+- `catbox.moe`, `tmpfiles.org` — Docupost's helper returned `Temporary error connecting to DocuPost Helpers - S3`. Do not use.
+- **GitHub raw on a public repo** — worked first try (this repo).
+- Vercel Blob / Cloudflare R2 with signed URLs — better for prod (keeps PDFs private + short TTL). Not yet wired.
+
 ## Known IDs (49th St Apartments)
 - Property ID (`proid`): `a262aa42-7393-4d84-9bf5-ae1bff852b32`
 
