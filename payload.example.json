@@ -1,0 +1,14 @@
+{
+  "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/99b6572f-7fce-4d4c-83ca-2f795c22041a",
+  "charges": [
+    { "description": "Full paint",      "amount": 800.00 },
+    { "description": "Carpet Cleaning", "amount": 200.00 }
+  ],
+  "morDate": null,
+  "email": {
+    "enabled": true,
+    "from": "property",
+    "template": "***MO Docs Email"
+  },
+  "outputDir": "out"
+}

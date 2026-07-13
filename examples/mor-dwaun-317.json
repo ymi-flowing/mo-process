@@ -1,0 +1,32 @@
+{
+  "resident": "Dwaun Spigner",
+  "unit": "317",
+  "property": "49th St Apartments",
+  "leaseId": "a874cee1-95b8-4a95-bf71-60219c5925af",
+  "personId": "9c6b6f9d-765e-41a9-bd19-f874edf30174",
+  "unitId": "6fbb164e-8a5b-4ea2-b4fe-c6871c3fa7d4",
+  "morDate": "7/13/2026",
+  "addedCharges": [
+    { "category": "Cleaning/Damage Charges", "description": "Cleaning", "amount": 150.00 },
+    { "category": "Cleaning/Damage Charges", "description": "Carpet Cleaning", "amount": 200.00 }
+  ],
+  "totals": {
+    "currentOpenBalanceTotal": 3257.90,
+    "finalMoveOutChargesCreditsTotal": 350.00,
+    "balanceBeforeDepositsTotal": 3607.90,
+    "availableDepositApplied": 899.00,
+    "paymentCreditRefund": 0.00,
+    "depositRefund": 0.00,
+    "balanceOwed": 2708.90
+  },
+  "forwardingAddress": {
+    "source": "unit (resident forwarding was blank)",
+    "street": "8400 49th Street North Apt. 317",
+    "unitNo": "317",
+    "city": "Pinellas Park",
+    "state": "FL",
+    "zip": "33781",
+    "county": null
+  },
+  "morStatus": "Complete"
+}

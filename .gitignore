@@ -1,0 +1,33 @@
+# Secrets
+Cardentials.txt
+.env
+.env.local
+.env.*.local
+
+# Runtime output
+out/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Word / Office lock files
+~$*
+
+# Node (only if we later add a JS bit)
+node_modules/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Playwright
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Screenshots left in home dir by tools
+*.png
