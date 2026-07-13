@@ -32,6 +32,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install LibreOffice (for docx→PDF)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip

@@ -548,9 +548,20 @@ def upload_document(page: Page, file_path: Path):
 
 def open_send_email_dialog(page: Page):
     log("Opening resident email dialog.")
-    # Click the resident's mailto link.
-    email_link = page.locator('a[href^="mailto:"]').first
-    email_link.click()
+    # ResMan's sticky footer ("dock" icons) and BalancesCell can intercept
+    # clicks on the mailto link in a smaller headless viewport. Skip
+    # Playwright's hit-testing and fire the click via JS instead.
+    hit = page.evaluate(
+        r"""() => {
+          const a = document.querySelector('a[href^="mailto:"]');
+          if (!a) return { ok: false, reason: 'no mailto link' };
+          a.scrollIntoView({ block: 'center' });
+          a.click();
+          return { ok: true, href: a.getAttribute('href') };
+        }"""
+    )
+    if not hit or not hit.get("ok"):
+        raise RuntimeError(f"Could not open email dialog: {hit}")
     page.wait_for_function(
         r"""() => !!document.getElementById('FromObject') && !!document.getElementById('Add')""",
         timeout=15000,
@@ -558,11 +569,14 @@ def open_send_email_dialog(page: Page):
 
 
 def set_from(page: Page, preference: str):
-    """preference: 'property' or 'assistant'."""
+    """preference: 'property' or 'assistant'. Safe to call multiple times —
+    ResMan's template + attachment flow can silently reset From to the
+    default Person, so we re-apply after both steps."""
     log(f"Setting From = {preference}")
     page.evaluate(
         r"""(pref) => {
           const sel = document.getElementById('FromObject');
+          if (!sel) return { err: 'no #FromObject' };
           const opts = Array.from(sel.options);
           const match = pref === 'property'
             ? opts.find(o => o.dataset.objectType === 'Property')
@@ -571,8 +585,10 @@ def set_from(page: Page, preference: str):
           sel.value = match.value;
           const display = document.getElementById('FromObjectInput');
           if (display) display.value = match.text;
-          window.jQuery(sel).trigger('change');
-          window.jQuery(display).trigger('change').trigger('autocompletechange');
+          if (window.jQuery) {
+            window.jQuery(sel).trigger('change');
+            if (display) window.jQuery(display).trigger('change').trigger('autocompletechange');
+          }
           return { selected: match.text };
         }""",
         preference,
@@ -686,24 +702,72 @@ def resident_email_from_page(page: Page) -> str:
     )
 
 
-def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, resident_name: str) -> Path | None:
-    """Convert claim docx -> PDF (needs MS Word), then merge with FAS PDF.
-    Skips gracefully if docx2pdf/pypdf are not available or Word isn't installed."""
+def _find_soffice() -> str | None:
+    """Locate LibreOffice's headless entrypoint on this machine."""
+    for cand in ("soffice", "libreoffice", "soffice.bin"):
+        p = shutil.which(cand)
+        if p:
+            return p
+    # Windows default install path
+    for p in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _docx_to_pdf(docx: Path) -> Path | None:
+    """Convert a .docx to .pdf (same directory). Tries LibreOffice first
+    (cross-platform, works on Linux CI), then docx2pdf (needs MS Word on
+    Windows / MacOS). Returns the PDF path or None."""
+    out_pdf = docx.with_suffix(".pdf")
+
+    soffice = _find_soffice()
+    if soffice:
+        import subprocess
+        log(f"docx→PDF via LibreOffice ({soffice})")
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf",
+                 "--outdir", str(docx.parent), str(docx)],
+                check=True, capture_output=True, timeout=120,
+            )
+            if out_pdf.exists():
+                return out_pdf
+            log("LibreOffice ran but no PDF produced.")
+        except Exception as e:
+            log(f"LibreOffice conversion failed: {e}")
+
     try:
-        from docx2pdf import convert
+        from docx2pdf import convert  # type: ignore
+        log("docx→PDF via docx2pdf (MS Word)")
+        convert(str(docx))
+        if out_pdf.exists():
+            return out_pdf
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"docx2pdf conversion failed: {e}")
+
+    return None
+
+
+def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, resident_name: str) -> Path | None:
+    """Convert claim docx -> PDF then merge with FAS PDF. Skips gracefully
+    if no docx→PDF converter is available on this machine."""
+    try:
         from pypdf import PdfWriter, PdfReader
     except ImportError as e:
         log(f"Skipping PDF merge (missing dependency: {e}).")
         return None
-    try:
-        convert(str(claim_docx))                     # writes <name>.pdf beside the docx
-    except Exception as e:
-        log(f"docx2pdf conversion failed: {e}")
+
+    claim_pdf = _docx_to_pdf(claim_docx)
+    if not claim_pdf:
+        log("Skipping PDF merge (no docx→PDF converter found — install LibreOffice or MS Word).")
         return None
-    claim_pdf = claim_docx.with_suffix(".pdf")
-    if not claim_pdf.exists():
-        log("docx2pdf did not produce a PDF; skipping merge.")
-        return None
+
     combined = out_dir / f"Combined - {safe_slug(resident_name)}.pdf"
     w = PdfWriter()
     for src in [claim_pdf, fas_pdf]:
@@ -771,7 +835,13 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless, args=["--start-maximized"])
-        context = browser.new_context(no_viewport=True)
+        # Headed: no_viewport lets Chrome fill the actual window.
+        # Headless: use an explicit large viewport so ResMan's sticky footer
+        # and BalancesCell don't cover the mailto link near the bottom.
+        if headless:
+            context = browser.new_context(viewport={"width": 1600, "height": 1200})
+        else:
+            context = browser.new_context(no_viewport=True)
         page = context.new_page()
 
         login(page)
@@ -847,6 +917,8 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
                 if fas_path:
                     attachment_names.append(fas_path.name)
             result["email"]["attachedByResMan"] = attach_from_resman(page, attachment_names)
+            # Attaching from ResMan often re-triggers the From default; re-set.
+            set_from(page, from_pref)
             result["email"]["to"] = result["resident"]["email"]
             result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"
             click_send(page)
