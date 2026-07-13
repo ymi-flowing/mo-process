@@ -27,6 +27,11 @@ The `mo-process.yml` workflow accepts a `workflow_dispatch` payload with three i
 **Repo secrets to set once** (Settings → Secrets and variables → Actions):
 - `RESMAN_USER` — defaults to `SNS_Assistant` if unset.
 - `RESMAN_PASS` — defaults to the SNS_Assistant password if unset.
+- `DOCUPOST_TOKEN` — required for the certified-mail step; if missing, the runner skips Docupost and records `docupost.skipped = "no_docupost_token"`.
+
+`GITHUB_TOKEN` is auto-provided by Actions and the workflow has `permissions: { contents: write }` so the runner can push the merged PDF into `examples/` via the Contents API.
+
+> **Privacy tradeoff:** every real resident's merged claim form briefly ends up as a public file at `raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move Out Docs - Unit <#>.pdf`. Rename / delete those files after each certified letter is safely mailed if that's a concern. A future change can move hosting to Vercel Blob / Cloudflare R2 with short-TTL signed URLs — the runner's `push_pdf_to_repo(...)` helper is the only piece that would swap.
 
 **n8n HTTP node to dispatch:**
 ```
@@ -92,13 +97,21 @@ The transform node uses `finalAmount` as `amount` (falling back to `originalAmou
     "from": "property",
     "template": "***MO Docs Email"
   },
+  "docupost": {
+    "enabled": true,
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "color":        false,
+    "doublesided":  false
+  },
   "outputDir": "out"
 }
 ```
 - `charges[].category` optional (default `Cleaning/Damage Charges`).
 - `morDate` optional (defaults to today in `M/D/YYYY`).
 - `email.from`: `property` (49th St - pm@49streetapts.com) or `assistant` (SNS_Assistant).
-- Credentials via env: `RESMAN_USER`, `RESMAN_PASS` (defaults to SNS_Assistant).
+- `docupost.enabled: false` (or omitting the block) skips the certified-mail step; the runner still uploads the docs and emails the resident.
+- Credentials via env: `RESMAN_USER`, `RESMAN_PASS` (defaults to SNS_Assistant); `DOCUPOST_TOKEN` (required for Docupost); `GITHUB_TOKEN` (auto-provided in Actions).
 
 ### Result (stdout JSON)
 ```json
@@ -163,7 +176,7 @@ See `Cardentials.txt` — ResMan web login (SNS_Assistant) + Partners API keys.
   - `mor-<resident>-<unit>.json` — captured totals, charges, forwarding address, MOR status.
   - `Claim Form - <resident>.docx` — generated claim form.
   - `Final Account Statement <date> - <resident>.pdf` — downloaded auto-generated FAS.
-  - `Combined - <resident>.pdf` — merged Claim Form + FAS (single PDF used for mailing).
+  - `Move Out Docs - Unit <#>.pdf` — merged Claim Form + FAS (single PDF used for mailing; named by unit so residents' files index cleanly by unit).
 
 ## Merging Claim Form + FAS into one PDF
 ```python
@@ -177,7 +190,7 @@ for src in [claim_form_pdf, fas_pdf]:
         w.add_page(page)
 w.write(str(combined_pdf))
 ```
-Order matters: Claim Form is page 1, FAS follows. The combined PDF is what gets mailed by Docupost.
+Order matters: Claim Form is page 1, FAS follows. The merged PDF (`Move Out Docs - Unit <#>.pdf`) is what gets uploaded to ResMan, attached to the resident email, and mailed by Docupost.
 
 ## Certified mail via Docupost
 Endpoint: `POST https://app.docupost.com/api/1.1/wf/sendletter` — **params go in the query string, not the body.**

@@ -10,5 +10,12 @@
     "from": "property",
     "template": "***MO Docs Email"
   },
+  "docupost": {
+    "enabled": true,
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "color":        false,
+    "doublesided":  false
+  },
   "outputDir": "out"
 }

@@ -118,12 +118,21 @@ const emailItems = [
   ["From",                email.from    || "—"],
   ["Template",            email.template || "—"],
   ["Subject",             email.subject || "—"],
-  ["Attachments",         (email.attachedByResMan || []).map((a) => a.name).join(", ") || "—"],
+  ["Attachments",         (email.attachedByResMan || []).length
+      ? (email.attachedByResMan || [])
+          .map((a) => `${a.checked ? "✓" : (a.missing ? "✗ MISSING" : "✗")} ${escapeHtml(a.name)}`)
+          .join("<br>")
+      : "—"],
 ];
-const emailCardHtml = emailItems.map(([k, v]) => `
+const emailCardHtml = emailItems.map(([k, v]) => {
+  // "Attachments" already contains inline HTML (<br> + ✓/✗ prefixes) —
+  // render raw. All other rows go through escapeHtml.
+  const cell = (k === "Attachments") ? v : escapeHtml(v);
+  return `
   <li style="margin:0 0 6px 0; border-bottom:1px solid #f0f0f0; padding-bottom:4px;">
-    <span style="font-weight:800;">${escapeHtml(k)}:</span> ${escapeHtml(v)}
-  </li>`).join("");
+    <span style="font-weight:800;">${escapeHtml(k)}:</span> ${cell}
+  </li>`;
+}).join("");
 
 const dp = data.docupost;
 const docupostHtml = dp ? [

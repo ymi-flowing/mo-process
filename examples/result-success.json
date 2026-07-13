@@ -39,7 +39,7 @@
   "docs": {
     "claimForm":   "out/Claim Form - Dwaun Spigner.docx",
     "fasPdf":      "out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf",
-    "combinedPdf": "out/Combined - Dwaun Spigner.pdf"
+    "combinedPdf": "out/Move Out Docs - Unit 317.pdf"
   },
   "email": {
     "attempted": true,
@@ -49,8 +49,7 @@
     "template": "***MO Docs Email",
     "subject": "49th St Apartments - Move-Out Documents",
     "attachedByResMan": [
-      { "name": "Claim Form - Dwaun Spigner.docx",     "checked": true },
-      { "name": "Final Account Statement 7-13-26.pdf", "checked": true }
+      { "name": "Move Out Docs - Unit 317.pdf", "checked": true }
     ]
   },
   "docupost": {
@@ -58,7 +57,7 @@
     "cost": 12.33,
     "class": "usps_first_class",
     "servicelevel": "certified",
-    "pdfUrl": "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Combined%20-%20Dwaun%20Spigner.pdf"
+    "pdfUrl": "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move%20Out%20Docs%20-%20Unit%20317.pdf"
   },
   "github": {
     "repo": "ymi-flowing/mo-process",

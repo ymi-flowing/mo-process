@@ -25,6 +25,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # contents:write is what push_pdf_to_repo needs — the runner uses the
+    # auto-provided GITHUB_TOKEN to PUT the Move Out Docs PDF into
+    # examples/ so Docupost can fetch it via raw.githubusercontent.com.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +51,10 @@ jobs:
       - name: Run MO Process
         id: run
         env:
-          RESMAN_USER: ${{ secrets.RESMAN_USER }}
-          RESMAN_PASS: ${{ secrets.RESMAN_PASS }}
+          RESMAN_USER:    ${{ secrets.RESMAN_USER }}
+          RESMAN_PASS:    ${{ secrets.RESMAN_PASS }}
+          DOCUPOST_TOKEN: ${{ secrets.DOCUPOST_TOKEN }}
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           echo '${{ inputs.payload }}' > payload.json

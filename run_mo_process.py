@@ -34,8 +34,24 @@ PAYLOAD (single object)
         "from": "property",               // "property" or "assistant"; default property
         "template": "***MO Docs Email"    // default "***MO Docs Email"
       },
+      "docupost": {                       // optional; skipped if enabled=false or omitted
+        "enabled": true,
+        "class":        "usps_first_class",
+        "servicelevel": "certified",
+        "color":        false,
+        "doublesided":  false,
+        "sender": {                       // optional; defaults to 49th St Apartments
+          "name": "49th St Apartments", "address1": "8400 49th Street N",
+          "city": "Pinellas Park", "state": "FL", "zip": "33781"
+        }
+      },
       "outputDir": "out"                  // optional; defaults to CWD
     }
+
+    Docupost step only runs when the resident email actually went AND we
+    produced a Combined PDF. Needs env DOCUPOST_TOKEN + GITHUB_TOKEN. The
+    runner pushes the Combined PDF to the public repo via the GitHub
+    Contents API to obtain a public URL Docupost can fetch.
 
 RESULT
     A single JSON object is ALWAYS printed to stdout at the end (both on success
@@ -89,6 +105,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote as urllib_quote
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
@@ -103,6 +120,23 @@ DEFAULT_TEMPLATE = "***MO Docs Email"
 
 HERE = Path(__file__).parent.resolve()
 CLAIM_TEMPLATE = HERE / "Claim Form Example.Docx"
+
+# --- Docupost + GitHub Contents API defaults ---
+DOCUPOST_URL         = "https://app.docupost.com/api/1.1/wf/sendletter"
+DOCUPOST_EXAMPLES    = "examples"     # path prefix in the repo where Move Out Docs PDFs land
+DOCUPOST_DEFAULTS = {
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "color":        False,
+    "doublesided":  False,
+}
+DEFAULT_SENDER = {
+    "name":     "49th St Apartments",
+    "address1": "8400 49th Street N",
+    "city":     "Pinellas Park",
+    "state":    "FL",
+    "zip":      "33781",
+}
 
 
 # ------------------------------ Utilities ----------------------------------
@@ -607,17 +641,58 @@ def apply_template(page: Page, template_name: str):
     )
 
 
-def attach_from_resman(page: Page, filenames: list):
-    log(f"Attaching from ResMan: {filenames}")
-    # Open Add menu (in email dialog Add button has id #Add).
-    page.locator('#Add').click()
-    page.locator('#btnAddFromCloud').click()
+def _open_attachment_picker(page: Page):
+    """Click Add → Add from ResMan in the email dialog. Waits for the picker
+    to render at least one document row."""
+    page.evaluate(
+        r"""() => {
+          document.getElementById('Add')?.click();
+        }"""
+    )
+    page.wait_for_timeout(400)
+    page.evaluate(
+        r"""() => {
+          document.getElementById('btnAddFromCloud')?.click();
+        }"""
+    )
     page.wait_for_function(
         r"""() => !!document.querySelector('.document-name, .doc-name')""",
         timeout=15000,
     )
 
-    checked = page.evaluate(
+
+def _cancel_attachment_picker(page: Page):
+    """Close the ResMan attachments picker (Cancel button). Only affects
+    the top-most dialog, i.e. the picker itself."""
+    page.evaluate(
+        r"""() => {
+          const btns = Array.from(document.querySelectorAll('button'))
+            .filter(b => b.textContent.trim() === 'Cancel' && b.getBoundingClientRect().width>0);
+          // The topmost Cancel belongs to the attachments picker.
+          btns[0]?.click();
+        }"""
+    )
+    page.wait_for_timeout(600)
+
+
+def _wait_picker_has_files(page: Page, filenames: list, timeout_ms: int):
+    """Wait until every requested filename is rendered as a .document-name
+    in the currently-open attachments picker. Raises PWTimeout on miss."""
+    page.wait_for_function(
+        r"""(names) => {
+          const rendered = Array.from(document.querySelectorAll('.document-name, .doc-name'))
+            .map(el => el.textContent.trim());
+          return names.every(n => rendered.includes(n));
+        }""",
+        arg=filenames,
+        timeout=timeout_ms,
+    )
+
+
+def _check_files_in_picker(page: Page, filenames: list) -> list:
+    """Tick the checkbox next to each filename in the visible picker.
+    Returns [{name, checked, missing?}, ...]."""
+    return page.evaluate(
         r"""(names) => {
           const results = [];
           names.forEach(name => {
@@ -630,30 +705,93 @@ def attach_from_resman(page: Page, filenames: list):
               if (cb && cb.getBoundingClientRect().width > 0) {
                 if (!cb.checked) cb.click();
                 results.push({ name, checked: cb.checked });
-                break;
+                return;
               }
             }
-            if (!results.find(r => r.name === name)) results.push({ name, checked: false, missing: true });
+            results.push({ name, checked: false, missing: true });
           });
           return results;
         }""",
         filenames,
     )
-    log(f"Attachment check result: {checked}")
 
-    # Click OK on the attachments picker.
+
+def attach_from_resman(page: Page, filenames: list) -> list:
+    """Attach each requested filename to the current Send Email dialog by
+    opening the 'Add from ResMan' picker. Retries up to 3 times with a
+    close/reopen if the picker's inventory doesn't include the file yet
+    (typical race right after upload_document). Raises RuntimeError when
+    still missing after retries so the outer runner records status:error
+    instead of sending an empty email.
+    """
+    log(f"Attaching from ResMan: {filenames}")
+
+    last_result: list = []
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        _open_attachment_picker(page)
+        # First try: wait up to 6s for our specific files to appear in the picker.
+        # Subsequent tries: wait longer, since the picker inventory refresh is
+        # what we're actually waiting on.
+        wait_ms = 6000 if attempt == 1 else 12000
+        try:
+            _wait_picker_has_files(page, filenames, timeout_ms=wait_ms)
+        except PWTimeout:
+            log(f"Picker attempt {attempt}: file(s) not indexed yet.")
+            last_result = [{"name": n, "checked": False, "missing": True} for n in filenames]
+            _cancel_attachment_picker(page)
+            if attempt < max_attempts:
+                page.wait_for_timeout(3000)
+                continue
+            raise RuntimeError(
+                f"Attachment(s) not found in ResMan picker after {max_attempts} attempts: {filenames}"
+            )
+
+        last_result = _check_files_in_picker(page, filenames)
+        log(f"Attachment check result: {last_result}")
+
+        missing = [r["name"] for r in last_result if r.get("missing") or not r.get("checked")]
+        if not missing:
+            break
+
+        log(f"Picker attempt {attempt}: still missing/unchecked = {missing}. Retrying.")
+        _cancel_attachment_picker(page)
+        if attempt >= max_attempts:
+            raise RuntimeError(
+                f"Attachment(s) still not selectable after {max_attempts} attempts: {missing}"
+            )
+        page.wait_for_timeout(3000)
+
+    # Click OK on the picker to commit the selection.
     page.evaluate(
         r"""() => {
           const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'OK' && b.getBoundingClientRect().width>0);
           btns[0]?.click();
         }"""
     )
-    page.wait_for_function(
-        r"""(names) => names.every(n => document.body.innerText.includes(n))""",
-        arg=filenames,
-        timeout=15000,
-    )
-    return checked
+
+    # Verify the parent email dialog's Attachments row now lists our files.
+    # We look inside the Send Email dialog specifically to avoid matching
+    # the same names in the ResMan Documents accordion behind it.
+    try:
+        page.wait_for_function(
+            r"""(names) => {
+              // Prefer scoping to the send-email dialog if we can find it.
+              const roots = Array.from(document.querySelectorAll('label, div, td'))
+                .filter(el => el.textContent.trim() === 'Attachments');
+              const scope = roots[0]?.closest('table, form, .ui-dialog') || document;
+              const text  = scope.innerText || scope.textContent || '';
+              return names.every(n => text.includes(n));
+            }""",
+            arg=filenames,
+            timeout=10000,
+        )
+    except PWTimeout:
+        raise RuntimeError(
+            f"Attachments row in email dialog does not show requested files: {filenames}"
+        )
+
+    return last_result
 
 
 def click_send(page: Page):
@@ -670,6 +808,135 @@ def click_send(page: Page):
         timeout=45000,
     )
     log("Email sent.")
+
+
+# ------------------------------ Docupost ----------------------------------
+
+def _b64_file(p: Path) -> str:
+    return base64.b64encode(p.read_bytes()).decode("ascii")
+
+
+def push_pdf_to_repo(pdf_path: Path, repo: str, token: str, target_dir: str = DOCUPOST_EXAMPLES) -> str:
+    """Push a PDF to `<repo>/<target_dir>/<pdf_path.name>` via the GitHub
+    Contents API and return the public raw.githubusercontent.com URL.
+
+    Uses PUT with a base64-encoded body. Overwrites the file if it already
+    exists (fetches its SHA first). The repo must be public for Docupost's
+    fetcher to reach the raw URL.
+
+    Raises RuntimeError on non-2xx.
+    """
+    try:
+        import requests  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(f"requests library missing (needed for GitHub push): {e}")
+
+    filename = pdf_path.name
+    path     = f"{target_dir}/{filename}"
+    api      = f"https://api.github.com/repos/{repo}/contents/{urllib_quote(path)}"
+    headers  = {
+        "Accept":        "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent":    "MO-Process-Runner/1.0",
+    }
+
+    # If the file already exists, we need its SHA to overwrite.
+    sha = None
+    r_get = requests.get(api + "?ref=main", headers=headers, timeout=30)
+    if r_get.status_code == 200:
+        sha = r_get.json().get("sha")
+
+    body = {
+        "message": f"add(examples): {filename}",
+        "content": _b64_file(pdf_path),
+        "branch":  "main",
+    }
+    if sha:
+        body["sha"] = sha
+
+    r = requests.put(api, headers=headers, json=body, timeout=120)
+    if r.status_code >= 300:
+        raise RuntimeError(f"GitHub push failed HTTP {r.status_code}: {r.text[:300]}")
+
+    raw_url = f"https://raw.githubusercontent.com/{repo}/main/{target_dir}/{urllib_quote(filename)}"
+    log(f"Pushed to repo: {path}")
+    return raw_url
+
+
+def _wait_raw_url_live(url: str, tries: int = 5, sleep_s: float = 2.0) -> bool:
+    try:
+        import requests  # type: ignore
+    except ImportError:
+        return False
+    for i in range(1, tries + 1):
+        try:
+            r = requests.head(url, allow_redirects=True, timeout=30)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        log(f"raw URL not ready (attempt {i}/{tries}); waiting {sleep_s}s")
+        time.sleep(sleep_s)
+    return False
+
+
+def send_via_docupost(cfg: dict, sender: dict, recipient: dict, pdf_url: str, token: str) -> dict:
+    """POST the Docupost sendletter request. Returns {letterId, cost, ...}.
+    Raises RuntimeError on API error."""
+    try:
+        import requests  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(f"requests library missing (needed for Docupost): {e}")
+
+    params = {
+        "api_token":    token,
+        "pdf":          pdf_url,
+        "class":        cfg.get("class",        DOCUPOST_DEFAULTS["class"]),
+        "servicelevel": cfg.get("servicelevel", DOCUPOST_DEFAULTS["servicelevel"]),
+        "color":        str(bool(cfg.get("color",       DOCUPOST_DEFAULTS["color"]))).lower(),
+        "doublesided":  str(bool(cfg.get("doublesided", DOCUPOST_DEFAULTS["doublesided"]))).lower(),
+        "description":  cfg.get("description", "")[:40],
+        "from_name":     sender["name"],
+        "from_address1": sender["address1"],
+        "from_city":     sender["city"],
+        "from_state":    sender["state"],
+        "from_zip":      sender["zip"],
+        "to_name":       recipient["name"],
+        "to_address1":   recipient["address1"],
+        "to_city":       recipient["city"],
+        "to_state":      recipient["state"],
+        "to_zip":        recipient["zip"],
+    }
+    if recipient.get("address2"):
+        params["to_address2"] = recipient["address2"]
+    if sender.get("address2"):
+        params["from_address2"] = sender["address2"]
+
+    r = requests.post(
+        DOCUPOST_URL, params=params,
+        headers={"Accept": "application/json", "User-Agent": "MO-Process-Runner/1.0"},
+        timeout=180,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Docupost HTTP {r.status_code}: {r.text[:400]}")
+
+    try:
+        obj = r.json()
+    except Exception:
+        raise RuntimeError(f"Docupost response not JSON: {r.text[:400]}")
+
+    letter_id = obj.get("letter_id") or obj.get("letterId")
+    cost      = obj.get("cost")
+    if not letter_id:
+        raise RuntimeError(f"Docupost response missing letter_id: {obj}")
+    log(f"Docupost queued letter_id={letter_id} cost=${cost}")
+    return {
+        "letterId":     letter_id,
+        "cost":         cost,
+        "class":        params["class"],
+        "servicelevel": params["servicelevel"],
+        "pdfUrl":       pdf_url,
+    }
 
 
 # ------------------------------ Runner main --------------------------------
@@ -754,9 +1021,13 @@ def _docx_to_pdf(docx: Path) -> Path | None:
     return None
 
 
-def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, resident_name: str) -> Path | None:
+def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, unit: str, resident_name: str = "") -> Path | None:
     """Convert claim docx -> PDF then merge with FAS PDF. Skips gracefully
-    if no docx→PDF converter is available on this machine."""
+    if no docx→PDF converter is available on this machine.
+
+    Output filename: `Move Out Docs - Unit <unit>.pdf` (falls back to the
+    resident's slug if the unit number isn't known).
+    """
     try:
         from pypdf import PdfWriter, PdfReader
     except ImportError as e:
@@ -768,7 +1039,8 @@ def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, r
         log("Skipping PDF merge (no docx→PDF converter found — install LibreOffice or MS Word).")
         return None
 
-    combined = out_dir / f"Combined - {safe_slug(resident_name)}.pdf"
+    label = f"Unit {unit}" if unit else (safe_slug(resident_name) or "Unknown")
+    combined = out_dir / f"Move Out Docs - {label}.pdf"
     w = PdfWriter()
     for src in [claim_pdf, fas_pdf]:
         for page_ in PdfReader(str(src)).pages:
@@ -779,7 +1051,7 @@ def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, r
         claim_pdf.unlink()  # keep only the merged PDF
     except FileNotFoundError:
         pass
-    log(f"Wrote combined PDF: {combined}")
+    log(f"Wrote merged PDF: {combined}")
     return combined
 
 
@@ -891,10 +1163,15 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         # Merge Claim Form + FAS into one PDF *before* uploading. We upload
         # only the merged PDF to ResMan's Documents (the docx becomes an
         # intermediate) so email attachments are a single, tidy file that
-        # matches what Docupost mails.
+        # matches what Docupost mails. Named `Move Out Docs - Unit <#>.pdf`
+        # so residents' files are indexed by unit, not by their name.
         combined = None
         if fas_path:
-            combined = merge_claim_and_fas_to_pdf(claim_form_path, fas_path, out_dir, resident_name)
+            combined = merge_claim_and_fas_to_pdf(
+                claim_form_path, fas_path, out_dir,
+                unit=result["resident"]["unit"] or "",
+                resident_name=resident_name,
+            )
             if combined:
                 result["docs"]["combinedPdf"] = str(combined)
 
@@ -904,6 +1181,11 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         upload_document(page, uploaded_doc)
 
         if email_enabled:
+            # ResMan's attachments picker fetches its inventory server-side
+            # when it opens — the just-uploaded file needs a moment to
+            # appear there. Without this settle, the picker often opens
+            # with our file still missing and the retry loop has to close/reopen.
+            page.wait_for_timeout(2500)
             open_send_email_dialog(page)
             set_from(page, from_pref)
             apply_template(page, template)
@@ -929,10 +1211,89 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         context.close()
         browser.close()
 
+    # ------- Docupost step (only if the resident email actually went) -------
+    dp_cfg = payload.get("docupost") or {}
+    if dp_cfg.get("enabled") and result["email"]["sent"] and combined:
+        try:
+            result["docupost"] = _maybe_send_docupost(
+                cfg=dp_cfg,
+                combined_pdf=combined,
+                resident_name=result["resident"]["name"],
+                resident_unit=result["resident"]["unit"],
+                forwarding=result["mor"]["forwardingAddress"] or {},
+                repo=result["github"]["repo"],
+            )
+        except Exception as e:
+            log(f"Docupost step failed: {type(e).__name__}: {e}")
+            result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
+    elif dp_cfg.get("enabled") and not result["email"]["sent"]:
+        log("Docupost skipped: resident email was not sent.")
+        result["docupost"] = {"skipped": "resident_email_not_sent"}
+    elif dp_cfg.get("enabled") and not combined:
+        log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
+        result["docupost"] = {"skipped": "no_combined_pdf"}
+
     result["status"] = "sent" if result["email"]["sent"] else ("parked" if not email_enabled else "sent_no_email")
     result["endedAt"] = now_iso()
     result["durationSeconds"] = int(time.time() - started)
     return result
+
+
+def _maybe_send_docupost(
+    cfg: dict,
+    combined_pdf: Path,
+    resident_name: str,
+    resident_unit: str,
+    forwarding: dict,
+    repo: str,
+) -> dict:
+    """Push the Combined PDF to the public repo, then hand its raw URL to
+    Docupost's sendletter API. Returns the docupost result block or a
+    {'skipped': reason} dict."""
+    token_docupost = os.environ.get("DOCUPOST_TOKEN")
+    token_gh       = os.environ.get("GITHUB_TOKEN")
+
+    if not token_docupost:
+        log("Docupost skipped: DOCUPOST_TOKEN env var missing.")
+        return {"skipped": "no_docupost_token"}
+    if not token_gh:
+        log("Docupost skipped: GITHUB_TOKEN missing (only available in Actions).")
+        return {"skipped": "no_github_token"}
+
+    # Recipient must have street + city + state + zip.
+    required = ("street", "city", "state", "zip")
+    if not all(forwarding.get(k) for k in required):
+        log(f"Docupost skipped: forwarding address incomplete ({[k for k in required if not forwarding.get(k)]})")
+        return {"skipped": "incomplete_address"}
+
+    # 1. Push the PDF and get its public raw URL.
+    raw_url = push_pdf_to_repo(combined_pdf, repo=repo, token=token_gh)
+    if not _wait_raw_url_live(raw_url):
+        return {"skipped": "raw_url_not_live", "pdfUrl": raw_url}
+
+    # 2. Build sender + recipient dicts.
+    sender = { **DEFAULT_SENDER, **(cfg.get("sender") or {}) }
+
+    # Split "8400 49th Street North Apt. 1113" into street1 + optional apt.
+    street = forwarding["street"]
+    address1, address2 = street, None
+    m = re.match(r"^(.*?)\s+(Apt\.?\s*\S+|Unit\s*\S+|#\s*\S+)$", street, re.I)
+    if m:
+        address1, address2 = m.group(1).strip(), m.group(2).strip()
+
+    recipient = {
+        "name":     resident_name or "",
+        "address1": address1,
+        "address2": address2,
+        "city":     forwarding["city"],
+        "state":    forwarding["state"],
+        "zip":      forwarding["zip"],
+    }
+
+    cfg = dict(cfg)  # avoid mutating payload
+    cfg.setdefault("description", f"MO {resident_unit or ''} {resident_name or ''}".strip()[:40])
+
+    return send_via_docupost(cfg, sender, recipient, raw_url, token_docupost)
 
 
 def main():
