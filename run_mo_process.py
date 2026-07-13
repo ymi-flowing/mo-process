@@ -1197,9 +1197,13 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         context.close()
         browser.close()
 
-    # ------- Docupost step (only if the resident email actually went) -------
+    # ------- Docupost step -------
+    # Runs unless the caller explicitly opts out with docupost.enabled=false.
+    # An absent block still means "please try" — matches the way the process
+    # is actually used (Fillout form doesn't send a docupost block).
     dp_cfg = payload.get("docupost") or {}
-    if dp_cfg.get("enabled") and result["email"]["sent"] and combined:
+    dp_enabled = dp_cfg.get("enabled") is not False   # None / True / missing → try
+    if dp_enabled and result["email"]["sent"] and combined:
         try:
             result["docupost"] = _maybe_send_docupost(
                 cfg=dp_cfg,
@@ -1212,12 +1216,15 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         except Exception as e:
             log(f"Docupost step failed: {type(e).__name__}: {e}")
             result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
-    elif dp_cfg.get("enabled") and not result["email"]["sent"]:
+    elif dp_enabled and not result["email"]["sent"]:
         log("Docupost skipped: resident email was not sent.")
         result["docupost"] = {"skipped": "resident_email_not_sent"}
-    elif dp_cfg.get("enabled") and not combined:
+    elif dp_enabled and not combined:
         log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
         result["docupost"] = {"skipped": "no_combined_pdf"}
+    else:
+        log("Docupost skipped: docupost.enabled=false in payload.")
+        result["docupost"] = {"skipped": "disabled_in_payload"}
 
     result["status"] = "sent" if result["email"]["sent"] else ("parked" if not email_enabled else "sent_no_email")
     result["endedAt"] = now_iso()
