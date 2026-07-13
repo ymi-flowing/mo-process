@@ -1,0 +1,38 @@
+{
+  "status": "error",
+  "startedAt": "2026-07-13T14:10:00Z",
+  "endedAt":   "2026-07-13T14:10:47Z",
+  "durationSeconds": 47,
+  "resident": {
+    "name": null,
+    "unit": null,
+    "property": null,
+    "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/00000000-0000-0000-0000-000000000000",
+    "email": null
+  },
+  "mor":   { "date": null, "status": null, "charges": [], "totals": null, "forwardingAddress": null, "forwardingSource": null },
+  "docs":  { "claimForm": null, "fasPdf": null, "combinedPdf": null },
+  "email": {
+    "attempted": false, "sent": false, "to": null,
+    "from": null, "template": null, "subject": null, "attachedByResMan": null
+  },
+  "docupost": null,
+  "github": {
+    "repo": "ymi-flowing/mo-process",
+    "runUrl": "https://github.com/ymi-flowing/mo-process/actions/runs/1234567890"
+  },
+  "logs": [
+    "14:10:00 Login user: 'SNS_Assistant'",
+    "14:10:15 Resident detail loaded; clicking Move Out Rec.",
+    "14:10:45 FATAL: TimeoutError: Timeout 30000ms exceeded waiting for element #MoveOutReconciliationLink"
+  ],
+  "error": {
+    "type": "TimeoutError",
+    "message": "Timeout 30000ms exceeded waiting for element #MoveOutReconciliationLink",
+    "traceback": [
+      "  File \"run_mo_process.py\", line 220, in open_move_out_rec",
+      "    page.wait_for_function(...)",
+      "playwright._impl._api_types.TimeoutError: Timeout 30000ms exceeded."
+    ]
+  }
+}

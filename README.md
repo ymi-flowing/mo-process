@@ -6,7 +6,7 @@ Automates closing out a former resident's Final Account Statement in ResMan and 
 - Resident URL (e.g. `https://sns.myresman.com/#/Residents/Detail/<leaseId>`)
 - List of move-out charges: `{ description, amount }` (default category: `Cleaning/Damage Charges`)
 
-## Run
+## Run (local)
 
 ```
 pip install -r requirements.txt
@@ -16,6 +16,44 @@ python run_mo_process.py --payload @payload.example.json --no-send   # dry-run: 
 python run_mo_process.py --payload @payload.example.json --headless  # CI
 python run_mo_process.py --payload -                                 # stdin JSON
 ```
+
+## Trigger via HTTP (n8n → GitHub Actions)
+
+The `mo-process.yml` workflow accepts a `workflow_dispatch` payload with three inputs:
+- `payload` — the JSON payload (as a single-line string).
+- `resume_url` — n8n webhook URL to POST the final result JSON back to.
+- `no_send` — `true` for dry-run (skip the resident-email Send click).
+
+**Repo secrets to set once** (Settings → Secrets and variables → Actions):
+- `RESMAN_USER` — defaults to `SNS_Assistant` if unset.
+- `RESMAN_PASS` — defaults to the SNS_Assistant password if unset.
+
+**n8n HTTP node to dispatch:**
+```
+POST https://api.github.com/repos/ymi-flowing/mo-process/actions/workflows/mo-process.yml/dispatches
+Headers:
+  Authorization: Bearer <GITHUB_PAT with 'workflow' scope>
+  Accept:        application/vnd.github+json
+Body:
+{
+  "ref": "main",
+  "inputs": {
+    "payload":    "{{ JSON.stringify($json.payload) }}",
+    "resume_url": "{{ $execution.resumeUrl }}",
+    "no_send":    "false"
+  }
+}
+```
+
+The workflow runs the Playwright script headless, POSTs the final result JSON to `resume_url`, and uploads `result.json` + `out/` as an artifact for post-mortem.
+
+### Result JSON — the shape n8n will get back
+
+Success → `examples/result-success.json`. Error → `examples/result-error.json`. Always these top-level keys: `status`, `startedAt`, `endedAt`, `durationSeconds`, `resident`, `mor`, `docs`, `email`, `docupost`, `github`, `logs`, `error`. `status` is one of `sent | sent_no_email | parked | error`.
+
+### Build a summary email in n8n
+
+`examples/n8n-email-builder.js` is a Code node that turns the run result into an SNS-branded HTML summary email (uses the tokens in `C:\Users\ymosh\Claude\ROI\email-guidelines.md`). It renders: status pill, resident block (name/unit/property/email + Open-in-ResMan link), charges list, reconciliation totals, forwarding address (with source), resident-email step result, and — when populated — the Docupost letter block. Downstream: pipe `htmlEmail` into a Gmail / SMTP node.
 
 ### Payload
 ```json

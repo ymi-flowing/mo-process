@@ -38,8 +38,45 @@ PAYLOAD (single object)
     }
 
 RESULT
-    A single JSON object is printed to stdout at the end summarizing what was done:
-    totals, saved file paths, MOR status, email send state.
+    A single JSON object is ALWAYS printed to stdout at the end (both on success
+    and on error). Downstream (n8n, GitHub Actions) can rely on this shape:
+
+    {
+      "status": "sent" | "sent_no_email" | "parked" | "error",
+      "startedAt": "2026-07-13T13:58:00Z",
+      "endedAt":   "2026-07-13T14:02:11Z",
+      "durationSeconds": 251,
+      "resident": {
+        "name": "Dwaun Spigner",
+        "unit": "317",
+        "property": "49th St Apartments",
+        "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/...",
+        "email": "dwaun803@gmail.com"
+      },
+      "mor": {
+        "date": "7/13/2026",
+        "status": "Complete",
+        "charges":  [ {"category":"Cleaning/Damage Charges","description":"...","amount":150} ],
+        "totals":   { "currentOpenBalanceTotal": "3,257.90", ... , "balanceOwed": "2,708.90" },
+        "forwardingAddress": { "street":"...", "city":"...", "state":"FL", "zip":"33781" },
+        "forwardingSource":  "resident" | "unit"
+      },
+      "docs": {
+        "claimForm":   "out/Claim Form - Dwaun Spigner.docx",
+        "fasPdf":      "out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf",
+        "combinedPdf": "out/Combined - Dwaun Spigner.pdf"
+      },
+      "email": {
+        "attempted": true, "sent": true, "to": "dwaun803@gmail.com",
+        "from": "property", "template": "***MO Docs Email",
+        "subject": "49th St Apartments - Move-Out Documents",
+        "attachedByResMan": [ {"name":"...","checked":true} ]
+      },
+      "docupost": null,
+      "github": { "repo": "ymi-flowing/mo-process", "runUrl": null },
+      "logs": [ "13:58:00 Login user: 'SNS_Assistant'", ... ],
+      "error": null   // populated on failure with { "message": "...", "type": "..." }
+    }
 """
 import argparse
 import base64
@@ -49,7 +86,8 @@ import re
 import sys
 import shutil
 import time
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
@@ -69,8 +107,17 @@ CLAIM_TEMPLATE = HERE / "Claim Form Example.Docx"
 
 # ------------------------------ Utilities ----------------------------------
 
+_LOGS: list[str] = []
+
+
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True, file=sys.stderr)
+    line = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
+    _LOGS.append(line)
+    print(line, flush=True, file=sys.stderr)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_payload(arg):
@@ -615,6 +662,48 @@ def unit_number_from_page(page: Page) -> str:
     )
 
 
+def resident_email_from_page(page: Page) -> str:
+    return page.evaluate(
+        r"""() => {
+          const a = document.querySelector('a[href^="mailto:"]');
+          return a ? a.getAttribute('href').replace(/^mailto:/, '') : '';
+        }"""
+    )
+
+
+def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, resident_name: str) -> Path | None:
+    """Convert claim docx -> PDF (needs MS Word), then merge with FAS PDF.
+    Skips gracefully if docx2pdf/pypdf are not available or Word isn't installed."""
+    try:
+        from docx2pdf import convert
+        from pypdf import PdfWriter, PdfReader
+    except ImportError as e:
+        log(f"Skipping PDF merge (missing dependency: {e}).")
+        return None
+    try:
+        convert(str(claim_docx))                     # writes <name>.pdf beside the docx
+    except Exception as e:
+        log(f"docx2pdf conversion failed: {e}")
+        return None
+    claim_pdf = claim_docx.with_suffix(".pdf")
+    if not claim_pdf.exists():
+        log("docx2pdf did not produce a PDF; skipping merge.")
+        return None
+    combined = out_dir / f"Combined - {safe_slug(resident_name)}.pdf"
+    w = PdfWriter()
+    for src in [claim_pdf, fas_pdf]:
+        for page_ in PdfReader(str(src)).pages:
+            w.add_page(page_)
+    with open(combined, "wb") as f:
+        w.write(f)
+    try:
+        claim_pdf.unlink()  # keep only the merged PDF
+    except FileNotFoundError:
+        pass
+    log(f"Wrote combined PDF: {combined}")
+    return combined
+
+
 def run(payload: dict, send: bool, headless: bool) -> dict:
     lease_url = payload["leaseUrl"]
     charges   = payload["charges"]
@@ -626,18 +715,44 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
     out_dir   = Path(payload.get("outputDir") or HERE / "out")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    result = {
-        "leaseUrl": lease_url,
-        "morDate": mor_date,
-        "morStatus": None,
-        "totals": None,
-        "forwardingAddress": None,
-        "forwardingSource": None,
-        "claimForm": None,
-        "fasPdf": None,
-        "emailSent": False,
-        "attachedByResMan": None,
+    result: dict = {
+        "status": None,
+        "startedAt": now_iso(),
+        "endedAt": None,
+        "durationSeconds": None,
+        "resident": {
+            "name": None, "unit": None, "property": "49th St Apartments",
+            "leaseUrl": lease_url, "email": None,
+        },
+        "mor": {
+            "date": mor_date, "status": None,
+            "charges": [
+                {"category": c.get("category", DEFAULT_CATEGORY),
+                 "description": c["description"],
+                 "amount": float(c["amount"])} for c in charges
+            ],
+            "totals": None,
+            "forwardingAddress": None,
+            "forwardingSource": None,
+        },
+        "docs": {"claimForm": None, "fasPdf": None, "combinedPdf": None},
+        "email": {
+            "attempted": email_enabled, "sent": False, "to": None,
+            "from": from_pref, "template": template,
+            "subject": None, "attachedByResMan": None,
+        },
+        "docupost": None,
+        "github": {
+            "repo": os.environ.get("GITHUB_REPOSITORY") or "ymi-flowing/mo-process",
+            "runUrl": (
+                f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+                if os.environ.get("GITHUB_RUN_ID") and os.environ.get("GITHUB_REPOSITORY") else None
+            ),
+        },
+        "logs": None,      # filled at the end
+        "error": None,
     }
+    started = time.time()
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless, args=["--start-maximized"])
@@ -648,48 +763,52 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         open_move_out_rec(page, lease_url)
         fill_mor_date(page, mor_date)
         for c in charges:
-            add_charge(
-                page,
-                description=c["description"],
-                amount=float(c["amount"]),
-                category=c.get("category", DEFAULT_CATEGORY),
-            )
+            add_charge(page,
+                       description=c["description"],
+                       amount=float(c["amount"]),
+                       category=c.get("category", DEFAULT_CATEGORY))
             page.wait_for_timeout(400)
 
-        totals = capture_mor_totals(page)
-        result["totals"] = totals
-        log(f"Totals: {totals}")
+        result["mor"]["totals"] = capture_mor_totals(page)
+        log(f"Totals: {result['mor']['totals']}")
 
         approve_mor(page)
-        result["morStatus"] = "Complete"
+        result["mor"]["status"] = "Complete"
 
         resident_name = resident_name_from_page(page)
-        unit_no = unit_number_from_page(page)
-        log(f"Resident: {resident_name!r} unit {unit_no!r}")
+        result["resident"]["name"]  = resident_name
+        result["resident"]["unit"]  = unit_number_from_page(page)
+        result["resident"]["email"] = resident_email_from_page(page)
+        log(f"Resident: {resident_name!r} unit {result['resident']['unit']!r}")
 
         fwd = get_forwarding_address(page)
         if fwd and fwd.get("street"):
-            result["forwardingSource"] = "resident"
+            result["mor"]["forwardingSource"] = "resident"
         else:
             log("Forwarding blank -> falling back to unit address.")
             fwd = get_unit_address_via_new_tab(context, page) or {}
-            result["forwardingSource"] = "unit"
-        result["forwardingAddress"] = fwd
+            result["mor"]["forwardingSource"] = "unit"
+        result["mor"]["forwardingAddress"] = fwd
 
         claim_form_path = generate_claim_form(
             out_dir=out_dir,
             resident_name=resident_name,
             date_str=datetime.now().strftime("%m/%d/%Y"),
             forwarding=fwd,
-            totals=totals,
+            totals=result["mor"]["totals"],
             charges=charges,
         )
-        result["claimForm"] = str(claim_form_path)
+        result["docs"]["claimForm"] = str(claim_form_path)
 
         fas_path = download_fas_pdf(page, out_dir, resident_name, mor_date)
-        result["fasPdf"] = str(fas_path) if fas_path else None
+        result["docs"]["fasPdf"] = str(fas_path) if fas_path else None
 
         upload_claim_form(page, claim_form_path)
+
+        if fas_path:
+            combined = merge_claim_and_fas_to_pdf(claim_form_path, fas_path, out_dir, resident_name)
+            if combined:
+                result["docs"]["combinedPdf"] = str(combined)
 
         if email_enabled:
             open_send_email_dialog(page)
@@ -699,15 +818,20 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             attachment_names = [claim_form_path.name]
             if fas_path:
                 attachment_names.append(fas_path.name)
-            result["attachedByResMan"] = attach_from_resman(page, attachment_names)
+            result["email"]["attachedByResMan"] = attach_from_resman(page, attachment_names)
+            result["email"]["to"] = result["resident"]["email"]
+            result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"
             click_send(page)
-            result["emailSent"] = True
+            result["email"]["sent"] = True
         else:
             log("Email skipped (either --no-send or email.enabled=false).")
 
         context.close()
         browser.close()
 
+    result["status"] = "sent" if result["email"]["sent"] else ("parked" if not email_enabled else "sent_no_email")
+    result["endedAt"] = now_iso()
+    result["durationSeconds"] = int(time.time() - started)
     return result
 
 
@@ -718,11 +842,52 @@ def main():
     ap.add_argument("--no-send", action="store_true", help="Skip the final email Send click")
     args = ap.parse_args()
 
-    payload = load_payload(args.payload)
-    result = run(payload, send=not args.no_send, headless=args.headless)
+    started_iso = now_iso()
+    started_t   = time.time()
+
+    payload = None
+    try:
+        payload = load_payload(args.payload)
+        result = run(payload, send=not args.no_send, headless=args.headless)
+        result["logs"] = list(_LOGS)
+    except Exception as e:
+        log(f"FATAL: {type(e).__name__}: {e}")
+        result = {
+            "status": "error",
+            "startedAt": started_iso,
+            "endedAt":   now_iso(),
+            "durationSeconds": int(time.time() - started_t),
+            "resident": {
+                "name": None, "unit": None, "property": None,
+                "leaseUrl": (payload or {}).get("leaseUrl") if isinstance(payload, dict) else None,
+                "email": None,
+            },
+            "mor":   {"date": None, "status": None, "charges": [], "totals": None,
+                      "forwardingAddress": None, "forwardingSource": None},
+            "docs":  {"claimForm": None, "fasPdf": None, "combinedPdf": None},
+            "email": {"attempted": False, "sent": False, "to": None,
+                      "from": None, "template": None, "subject": None,
+                      "attachedByResMan": None},
+            "docupost": None,
+            "github": {
+                "repo":   os.environ.get("GITHUB_REPOSITORY") or "ymi-flowing/mo-process",
+                "runUrl": (
+                    f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+                    if os.environ.get("GITHUB_RUN_ID") and os.environ.get("GITHUB_REPOSITORY") else None
+                ),
+            },
+            "logs":  list(_LOGS),
+            "error": {
+                "type": type(e).__name__,
+                "message": str(e),
+                "traceback": traceback.format_exc().splitlines()[-10:],
+            },
+        }
 
     # Emit a single JSON result on stdout so callers/CI can capture it.
     print(json.dumps(result, indent=2, default=str))
+    # Non-zero exit on error so GH Actions marks the job failed but still emits JSON.
+    sys.exit(1 if result.get("status") == "error" else 0)
 
 
 if __name__ == "__main__":

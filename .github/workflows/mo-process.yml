@@ -1,0 +1,80 @@
+name: MO Process
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'MO Process payload (JSON, single line)'
+        required: true
+        type: string
+      resume_url:
+        description: 'n8n webhook URL to POST the final JSON back to'
+        required: false
+        type: string
+      no_send:
+        description: 'Dry-run — skip clicking Send on the resident email'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: mo-process-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run MO Process
+        id: run
+        env:
+          RESMAN_USER: ${{ secrets.RESMAN_USER }}
+          RESMAN_PASS: ${{ secrets.RESMAN_PASS }}
+        run: |
+          set +e
+          echo '${{ inputs.payload }}' > payload.json
+          FLAGS="--headless"
+          if [ "${{ inputs.no_send }}" = "true" ]; then FLAGS="$FLAGS --no-send"; fi
+          python run_mo_process.py --payload @payload.json $FLAGS > result.json
+          EXIT=$?
+          echo "exit=$EXIT" >> "$GITHUB_OUTPUT"
+          echo "--- result.json ---"
+          cat result.json
+          exit 0
+
+      - name: POST result back to n8n resume URL
+        if: ${{ inputs.resume_url != '' }}
+        env:
+          RESUME_URL: ${{ inputs.resume_url }}
+        run: |
+          curl -sS -X POST \
+            -H 'Content-Type: application/json' \
+            --data @result.json \
+            "$RESUME_URL"
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mo-process-result
+          path: |
+            result.json
+            out/
+          if-no-files-found: warn
+
+      - name: Fail job if runner errored
+        if: steps.run.outputs.exit != '0'
+        run: exit ${{ steps.run.outputs.exit }}

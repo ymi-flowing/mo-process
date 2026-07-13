@@ -1,0 +1,92 @@
+{
+  "status": "sent",
+  "startedAt": "2026-07-13T13:58:00Z",
+  "endedAt":   "2026-07-13T14:02:11Z",
+  "durationSeconds": 251,
+  "resident": {
+    "name": "Dwaun Spigner",
+    "unit": "317",
+    "property": "49th St Apartments",
+    "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/a874cee1-95b8-4a95-bf71-60219c5925af",
+    "email": "dwaun803@gmail.com"
+  },
+  "mor": {
+    "date": "7/13/2026",
+    "status": "Complete",
+    "charges": [
+      { "category": "Cleaning/Damage Charges", "description": "Cleaning",        "amount": 150.00 },
+      { "category": "Cleaning/Damage Charges", "description": "Carpet Cleaning", "amount": 200.00 }
+    ],
+    "totals": {
+      "currentOpenBalanceTotal": "3,257.90",
+      "finalMoveOutChargesCreditsTotal": "350.00",
+      "balanceBeforeDepositsTotal": "3,607.90",
+      "availableDepositApplied": "899.00",
+      "paymentCreditRefund": "0.00",
+      "depositRefund": "0.00",
+      "balanceOwed": "2,708.90"
+    },
+    "forwardingAddress": {
+      "street": "8400 49th Street North Apt. 317",
+      "unitNo": "317",
+      "city": "Pinellas Park",
+      "state": "FL",
+      "zip": "33781",
+      "county": null
+    },
+    "forwardingSource": "unit"
+  },
+  "docs": {
+    "claimForm":   "out/Claim Form - Dwaun Spigner.docx",
+    "fasPdf":      "out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf",
+    "combinedPdf": "out/Combined - Dwaun Spigner.pdf"
+  },
+  "email": {
+    "attempted": true,
+    "sent": true,
+    "to": "dwaun803@gmail.com",
+    "from": "property",
+    "template": "***MO Docs Email",
+    "subject": "49th St Apartments - Move-Out Documents",
+    "attachedByResMan": [
+      { "name": "Claim Form - Dwaun Spigner.docx",     "checked": true },
+      { "name": "Final Account Statement 7-13-26.pdf", "checked": true }
+    ]
+  },
+  "docupost": {
+    "letterId": "1783965376009x528503078122137150",
+    "cost": 12.33,
+    "class": "usps_first_class",
+    "servicelevel": "certified",
+    "pdfUrl": "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Combined%20-%20Dwaun%20Spigner.pdf"
+  },
+  "github": {
+    "repo": "ymi-flowing/mo-process",
+    "runUrl": "https://github.com/ymi-flowing/mo-process/actions/runs/1234567890"
+  },
+  "logs": [
+    "13:58:00 Login user: 'SNS_Assistant'",
+    "13:58:12 Resident detail loaded; clicking Move Out Rec.",
+    "13:58:15 Setting Move-out rec. date = 7/13/2026",
+    "13:58:16 Adding charge: Cleaning = $150.0 (Cleaning/Damage Charges)",
+    "13:58:20 Adding charge: Carpet Cleaning = $200.0 (Cleaning/Damage Charges)",
+    "13:58:26 Actions -> Approve",
+    "13:58:34 MOR approved.",
+    "13:58:36 Resident: 'Dwaun Spigner' unit '317'",
+    "13:58:38 Forwarding blank -> falling back to unit address.",
+    "13:58:47 Wrote claim form: out/Claim Form - Dwaun Spigner.docx",
+    "13:58:59 Downloading FAS PDF: Final Account Statement 7-13-26.pdf",
+    "13:59:01 Saved FAS PDF: out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf (75994 bytes)",
+    "13:59:03 Uploading claim form via Documents > Add.",
+    "13:59:14 Claim form uploaded.",
+    "13:59:20 Wrote combined PDF: out/Combined - Dwaun Spigner.pdf",
+    "13:59:25 Opening resident email dialog.",
+    "13:59:28 Setting From = property",
+    "13:59:30 Applying template: ***MO Docs Email",
+    "13:59:35 Setting From = property",
+    "13:59:37 Attaching from ResMan: ['Claim Form - Dwaun Spigner.docx', 'Final Account Statement 7-13-26.pdf']",
+    "14:02:05 Clicking Send.",
+    "14:02:11 Email sent."
+  ],
+  "error": null
+}
