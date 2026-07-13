@@ -355,13 +355,17 @@ def parse_address_lines(text: str) -> dict:
 
 
 def get_unit_address_via_new_tab(context, page: Page) -> dict:
-    """Follow the Unit link on the resident page in a new tab and read Address."""
+    """Follow the Unit link on the resident page in a new tab and read Address.
+
+    The Unit page renders the address label as `Address*` (with a required
+    asterisk from a hidden <span class="required">). We match on the LABEL
+    for="Address" — that's the ResMan-stable selector — and read the sibling
+    `.fv` div for the value.
+    """
     unit_href = page.evaluate(
         r"""() => {
-          // Find the numeric unit link in Unit Information (small integer unit id).
           const links = Array.from(document.querySelectorAll('a[href*="/Units/Detail/"]'));
-          if (!links.length) return null;
-          return links[0].getAttribute('href');
+          return links[0] ? links[0].getAttribute('href') : null;
         }"""
     )
     if not unit_href:
@@ -370,22 +374,33 @@ def get_unit_address_via_new_tab(context, page: Page) -> dict:
     unit_page = context.new_page()
     try:
         unit_page.goto(url, wait_until="domcontentloaded")
-        # Wait for the Address block to render.
+        # Wait for the Address label (for="Address") to appear.
+        unit_page.wait_for_function(
+            r"""() => !!document.querySelector('label[for="Address"]')""",
+            timeout=30000,
+        )
+        # Give the field value a moment to hydrate.
         unit_page.wait_for_function(
             r"""() => {
-              const labels = Array.from(document.querySelectorAll('label, .fl'));
-              return labels.some(l => l.textContent.trim() === 'Address');
+              const lbl  = document.querySelector('label[for="Address"]');
+              const cell = lbl?.closest('td');
+              const fv   = cell?.querySelector('.fv');
+              return fv && fv.textContent.trim().length > 0;
             }""",
-            timeout=20000,
+            timeout=15000,
         )
         addr_text = unit_page.evaluate(
             r"""() => {
-              const labels = Array.from(document.querySelectorAll('label, .fl'));
-              const label  = labels.find(l => l.textContent.trim() === 'Address');
-              if (!label) return null;
-              const cell = label.closest('td');
-              const fv   = cell?.querySelector('.fv') || cell?.querySelector('div:not(.fl)');
-              return fv ? fv.textContent.trim() : cell?.textContent.replace('Address','').trim();
+              const lbl  = document.querySelector('label[for="Address"]');
+              const cell = lbl?.closest('td');
+              const fv   = cell?.querySelector('.fv');
+              if (!fv) return null;
+              // Prefer the structured child divs (street / city+state+zip / country).
+              const parts = Array.from(fv.querySelectorAll('div, span'))
+                .map(el => el.textContent.trim())
+                .filter(t => t.length && t !== 'United States');
+              if (parts.length) return parts.join('\n');
+              return fv.textContent.trim();
             }"""
         )
     finally:
@@ -503,15 +518,15 @@ def download_fas_pdf(page: Page, out_dir: Path, resident_name: str, date_str: st
     return dst
 
 
-def upload_claim_form(page: Page, claim_form_path: Path):
-    """Click Add under Documents, pick file, click OK."""
-    log("Uploading claim form via Documents > Add.")
+def upload_document(page: Page, file_path: Path):
+    """Click Add under Documents, pick file, click OK. Works for any file type."""
+    log(f"Uploading document via Documents > Add: {file_path.name}")
     with page.expect_file_chooser() as fc_info:
         page.locator('button.add-files').click()
         page.wait_for_timeout(800)  # let the dialog render
         page.locator('input[type="file"]').click()
     fc = fc_info.value
-    fc.set_files(str(claim_form_path))
+    fc.set_files(str(file_path))
     # Wait for the Name field to auto-populate then click the dialog's OK.
     page.wait_for_timeout(1000)
     page.evaluate(
@@ -523,10 +538,10 @@ def upload_claim_form(page: Page, claim_form_path: Path):
     # Wait for the dialog to close and the doc to appear.
     page.wait_for_function(
         r"""(fname) => Array.from(document.querySelectorAll('.document-name')).some(el => el.textContent.trim() === fname)""",
-        arg=claim_form_path.name,
+        arg=file_path.name,
         timeout=30000,
     )
-    log("Claim form uploaded.")
+    log(f"Uploaded: {file_path.name}")
 
 
 # ------------------------------- Send Email --------------------------------
@@ -803,21 +818,34 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         fas_path = download_fas_pdf(page, out_dir, resident_name, mor_date)
         result["docs"]["fasPdf"] = str(fas_path) if fas_path else None
 
-        upload_claim_form(page, claim_form_path)
-
+        # Merge Claim Form + FAS into one PDF *before* uploading. We upload
+        # only the merged PDF to ResMan's Documents (the docx becomes an
+        # intermediate) so email attachments are a single, tidy file that
+        # matches what Docupost mails.
+        combined = None
         if fas_path:
             combined = merge_claim_and_fas_to_pdf(claim_form_path, fas_path, out_dir, resident_name)
             if combined:
                 result["docs"]["combinedPdf"] = str(combined)
+
+        # Prefer the Combined PDF for upload; fall back to the docx if the
+        # merge step didn't run (Word missing, deps missing, etc.).
+        uploaded_doc = combined or claim_form_path
+        upload_document(page, uploaded_doc)
 
         if email_enabled:
             open_send_email_dialog(page)
             set_from(page, from_pref)
             apply_template(page, template)
             set_from(page, from_pref)  # template resets From; re-set.
-            attachment_names = [claim_form_path.name]
-            if fas_path:
-                attachment_names.append(fas_path.name)
+            # Attach only the Combined PDF when available (contains both
+            # Claim Form + FAS); otherwise the two separate docs.
+            if combined:
+                attachment_names = [combined.name]
+            else:
+                attachment_names = [claim_form_path.name]
+                if fas_path:
+                    attachment_names.append(fas_path.name)
             result["email"]["attachedByResMan"] = attach_from_resman(page, attachment_names)
             result["email"]["to"] = result["resident"]["email"]
             result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"

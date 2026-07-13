@@ -1,0 +1,18 @@
+{
+  "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/405d7653-579c-4764-b466-4c2078cc648b",
+  "charges": [
+    { "description": "Cleaning",          "amount": 300.00 },
+    { "description": "Pest control",      "amount": 400.00 },
+    { "description": "Resurfacing",       "amount": 500.00 },
+    { "description": "Cabinets repairs",  "amount": 800.00 },
+    { "description": "Full Paint",        "amount": 800.00 },
+    { "description": "Appliances damage", "amount": 1000.00 },
+    { "description": "Broken blinds",     "amount": 200.00 }
+  ],
+  "email": {
+    "enabled": true,
+    "from": "property",
+    "template": "***MO Docs Email"
+  },
+  "outputDir": "out"
+}

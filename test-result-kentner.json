@@ -1,0 +1,90 @@
+15:26:09 Login user: 'SNS_Assistant'
+15:26:18 Resident detail loaded; clicking Move Out Rec.
+15:26:19 Setting Move-out rec. date = 7/13/2026
+15:26:19 Adding charge: Cleaning = $300.0 (Cleaning/Damage Charges)
+15:26:20 Adding charge: Pest control = $400.0 (Cleaning/Damage Charges)
+15:26:21 Adding charge: Resurfacing = $500.0 (Cleaning/Damage Charges)
+15:26:22 Adding charge: Cabinets repairs = $800.0 (Cleaning/Damage Charges)
+15:26:22 Adding charge: Full Paint = $800.0 (Cleaning/Damage Charges)
+15:26:23 Adding charge: Appliances damage = $1000.0 (Cleaning/Damage Charges)
+15:26:24 Adding charge: Broken blinds = $200.0 (Cleaning/Damage Charges)
+15:26:25 Totals: {'currentOpenBalanceTotal': '0.00', 'finalMoveOutChargesCreditsTotal': '4,000.00', 'balanceBeforeDepositsTotal': '4,000.00', 'availableDepositApplied': '399.00', 'paymentCreditRefund': '0.00', 'depositRefund': '0.00', 'balanceOwed': '3,601.00'}
+15:26:25 Actions -> Approve
+15:26:36 MOR approved.
+15:26:36 Resident: 'Daniel Kentner' unit '1113'
+15:26:36 Forwarding blank -> falling back to unit address.
+15:26:57 FATAL: TimeoutError: Page.wait_for_function: Timeout 20000ms exceeded.
+{
+  "status": "error",
+  "startedAt": "2026-07-13T18:26:03Z",
+  "endedAt": "2026-07-13T18:26:57Z",
+  "durationSeconds": 54,
+  "resident": {
+    "name": null,
+    "unit": null,
+    "property": null,
+    "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/405d7653-579c-4764-b466-4c2078cc648b",
+    "email": null
+  },
+  "mor": {
+    "date": null,
+    "status": null,
+    "charges": [],
+    "totals": null,
+    "forwardingAddress": null,
+    "forwardingSource": null
+  },
+  "docs": {
+    "claimForm": null,
+    "fasPdf": null,
+    "combinedPdf": null
+  },
+  "email": {
+    "attempted": false,
+    "sent": false,
+    "to": null,
+    "from": null,
+    "template": null,
+    "subject": null,
+    "attachedByResMan": null
+  },
+  "docupost": null,
+  "github": {
+    "repo": "ymi-flowing/mo-process",
+    "runUrl": null
+  },
+  "logs": [
+    "15:26:09 Login user: 'SNS_Assistant'",
+    "15:26:18 Resident detail loaded; clicking Move Out Rec.",
+    "15:26:19 Setting Move-out rec. date = 7/13/2026",
+    "15:26:19 Adding charge: Cleaning = $300.0 (Cleaning/Damage Charges)",
+    "15:26:20 Adding charge: Pest control = $400.0 (Cleaning/Damage Charges)",
+    "15:26:21 Adding charge: Resurfacing = $500.0 (Cleaning/Damage Charges)",
+    "15:26:22 Adding charge: Cabinets repairs = $800.0 (Cleaning/Damage Charges)",
+    "15:26:22 Adding charge: Full Paint = $800.0 (Cleaning/Damage Charges)",
+    "15:26:23 Adding charge: Appliances damage = $1000.0 (Cleaning/Damage Charges)",
+    "15:26:24 Adding charge: Broken blinds = $200.0 (Cleaning/Damage Charges)",
+    "15:26:25 Totals: {'currentOpenBalanceTotal': '0.00', 'finalMoveOutChargesCreditsTotal': '4,000.00', 'balanceBeforeDepositsTotal': '4,000.00', 'availableDepositApplied': '399.00', 'paymentCreditRefund': '0.00', 'depositRefund': '0.00', 'balanceOwed': '3,601.00'}",
+    "15:26:25 Actions -> Approve",
+    "15:26:36 MOR approved.",
+    "15:26:36 Resident: 'Daniel Kentner' unit '1113'",
+    "15:26:36 Forwarding blank -> falling back to unit address.",
+    "15:26:57 FATAL: TimeoutError: Page.wait_for_function: Timeout 20000ms exceeded."
+  ],
+  "error": {
+    "type": "TimeoutError",
+    "message": "Page.wait_for_function: Timeout 20000ms exceeded.",
+    "traceback": [
+      "    await self._channel.send(\"waitForFunction\", self._timeout, params)",
+      "  File \"C:\\Users\\ymosh\\AppData\\Roaming\\Python\\Python314\\site-packages\\playwright\\_impl\\_connection.py\", line 69, in send",
+      "    return await self._connection.wrap_api_call(",
+      "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+      "    ...<3 lines>...",
+      "    )",
+      "    ^",
+      "  File \"C:\\Users\\ymosh\\AppData\\Roaming\\Python\\Python314\\site-packages\\playwright\\_impl\\_connection.py\", line 559, in wrap_api_call",
+      "    raise rewrite_error(error, f\"{parsed_st['apiName']}: {error}\") from None",
+      "playwright._impl._errors.TimeoutError: Page.wait_for_function: Timeout 20000ms exceeded."
+    ]
+  }
+}
