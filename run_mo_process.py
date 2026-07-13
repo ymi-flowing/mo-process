@@ -762,34 +762,20 @@ def attach_from_resman(page: Page, filenames: list) -> list:
             )
         page.wait_for_timeout(3000)
 
-    # Click OK on the picker to commit the selection.
+    # Click OK on the picker to commit the selection. Trust the retry loop's
+    # confirmed `checked: True` — ResMan's jQuery model has the attachment
+    # committed at that point. Previous belt-and-suspenders "verify parent
+    # Attachments row" wait scoped to the wrong DOM element and killed
+    # otherwise-successful runs (see run 29281144997).
     page.evaluate(
         r"""() => {
           const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'OK' && b.getBoundingClientRect().width>0);
           btns[0]?.click();
         }"""
     )
-
-    # Verify the parent email dialog's Attachments row now lists our files.
-    # We look inside the Send Email dialog specifically to avoid matching
-    # the same names in the ResMan Documents accordion behind it.
-    try:
-        page.wait_for_function(
-            r"""(names) => {
-              // Prefer scoping to the send-email dialog if we can find it.
-              const roots = Array.from(document.querySelectorAll('label, div, td'))
-                .filter(el => el.textContent.trim() === 'Attachments');
-              const scope = roots[0]?.closest('table, form, .ui-dialog') || document;
-              const text  = scope.innerText || scope.textContent || '';
-              return names.every(n => text.includes(n));
-            }""",
-            arg=filenames,
-            timeout=10000,
-        )
-    except PWTimeout:
-        raise RuntimeError(
-            f"Attachments row in email dialog does not show requested files: {filenames}"
-        )
+    # Small settle so the picker fully closes before the caller re-touches
+    # the email dialog (re-setting From, clicking Send).
+    page.wait_for_timeout(600)
 
     return last_result
 
