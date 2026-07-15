@@ -20,6 +20,52 @@ End-to-end validated via Fillout → n8n → GitHub Actions on **Sheri Kovalik /
 
 The sent email shows as `<date> | <resident> | <Property> - Move-Out Documents | Email`. It also appears (with more delay) as a PDF under `Documents → Email Communication`.
 
+**The runner now verifies this automatically.** After clicking Send, it opens the Communication Log accordion, waits for the Kendo grid to hydrate, and looks for the row. Result JSON gains `email.commLogVerified` (bool) and `email.commLogRow` (the matched row text). If verification fails, `status` is downgraded from `sent` → `sent_no_email` so the n8n summary email flags it.
+
+## Multi-property support
+
+Properties are declared in `properties.json` at the repo root. Each entry drives the property-specific data on the Claim Form + Docupost sender:
+
+```json
+{
+  "49th St Apartments": {
+    "proid":    "a262aa42-7393-4d84-9bf5-ae1bff852b32",
+    "email":    "pm@49streetapts.com",
+    "address1": "8400 49th Street N",
+    "city":     "Pinellas Park",
+    "state":    "FL",
+    "zip":      "33781"
+  },
+  "The Villas at Ortega": {
+    "proid":    null,
+    "email":    "pm@thevillasatortega.com",
+    "address1": "5327 Timuquana Rd",
+    "city":     "Jacksonville",
+    "state":    "FL",
+    "zip":      "32210"
+  }
+}
+```
+
+**How the runner picks the property**, in order:
+1. `payload.property` if the caller passed an explicit name.
+2. `proid` GUID captured from the resident detail page's `#MoveOutReconciliationLink` `data-href` attribute (matched against DB entries with a non-null `proid`).
+3. Body-text substring match against DB keys.
+
+If none of the above resolves, the runner raises **before** touching MOR — so a misconfigured property doesn't leave a half-completed reconciliation.
+
+**What each field drives**:
+- `email` → Claim Form paragraph "If you wish to dispute or disagree with any charges, submit your request via email to the Property Manager at: `<email>`". The email dialog's From: is set independently by ResMan (`objectType === 'Property'`).
+- `address1` / `city` / `state` / `zip` → Claim Form return-address line (FL § 83.49(3) requires the landlord's mailing address on the notice) **and** the Docupost `from_*` sender fields.
+- `proid` → optional but recommended. Once you know a property's GUID (visible in the runner's `Property signals:` log line on the first run), pin it in the DB so future runs resolve via exact match instead of body-text.
+
+**To add a new property**:
+1. Add a top-level entry to `properties.json`. `proid` may start as `null` — the runner will fall back to body-text name match, which works as long as the DB key is a substring of what ResMan displays on the resident detail page.
+2. In ResMan, make sure the new property has an email template named `***MO Docs Email` (or override via `payload.email.template`). Without it, `apply_template` will time out AFTER MOR is approved.
+3. First real run: watch the `Property signals:` log line for the `proid` and pin it in the DB.
+
+**Rendered samples** live in `examples/claim-form-samples/` — one Claim Form per property using synthetic resident data, so you can eyeball the property-specific paragraphs (return address, email) without opening a real resident's file.
+
 ## Input
 - Resident URL (e.g. `https://sns.myresman.com/#/Residents/Detail/<leaseId>`)
 - List of move-out charges: `{ description, amount }` (default category: `Cleaning/Damage Charges`)
