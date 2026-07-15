@@ -2,10 +2,66 @@
   "49th St Apartments": {
     "proid":    "a262aa42-7393-4d84-9bf5-ae1bff852b32",
     "email":    "pm@49streetapts.com",
-    "address1": "8400 49th Street N",
+    "address1": "8400 49th St N",
     "city":     "Pinellas Park",
     "state":    "FL",
     "zip":      "33781"
+  },
+  "Arbor Place Apartments": {
+    "proid":    null,
+    "email":    "pm@arborplacejacksonville.com",
+    "address1": "5800 Barnes Rd S",
+    "city":     "Jacksonville",
+    "state":    "FL",
+    "zip":      "32216"
+  },
+  "Marbella Park": {
+    "proid":    null,
+    "email":    "pm@marbellaparkapts.com",
+    "address1": "5528 Cinderlane Pky",
+    "city":     "Orlando",
+    "state":    "FL",
+    "zip":      "32808"
+  },
+  "Riverside at Orange Park": {
+    "proid":    null,
+    "email":    "pm@riversideatorangepark.com",
+    "address1": "606 Park Ave",
+    "city":     "Orange Park",
+    "state":    "FL",
+    "zip":      "32073"
+  },
+  "The Morgan At Ocala Apartments": {
+    "proid":    null,
+    "email":    "pm@themorganatocala.com",
+    "address1": "1421 SW 27th Ave",
+    "city":     "Ocala",
+    "state":    "FL",
+    "zip":      "34471"
+  },
+  "The Mustang at Ocala": {
+    "proid":    null,
+    "email":    "pm@themustangatocalaapts.com",
+    "address1": "2701 NE 7th St",
+    "city":     "Ocala",
+    "state":    "FL",
+    "zip":      "34470"
+  },
+  "The Village at Eastpointe Apartments": {
+    "proid":    null,
+    "email":    "pm@the-village-apts.com",
+    "address1": "5201 N Dixie Hwy",
+    "city":     "Fort Lauderdale",
+    "state":    "FL",
+    "zip":      "33334"
+  },
+  "The Village at San Jose": {
+    "proid":    null,
+    "email":    "pm@thevillageatsanjoseapts.com",
+    "address1": "5551 Auburn Rd",
+    "city":     "Jacksonville",
+    "state":    "FL",
+    "zip":      "32207"
   },
   "The Villas at Ortega": {
     "proid":    null,
@@ -14,5 +70,21 @@
     "city":     "Jacksonville",
     "state":    "FL",
     "zip":      "32210"
+  },
+  "The Vista At Winter Park": {
+    "proid":    null,
+    "email":    "pm@thevistaatwinterpark.com",
+    "address1": "4704 Lucier Ct",
+    "city":     "Winter Park",
+    "state":    "FL",
+    "zip":      "32792"
+  },
+  "The River Apartments": {
+    "proid":    null,
+    "email":    "pm.ft@snsmgmt.com",
+    "address1": "510 - 526 SW 20 Ave",
+    "city":     "Fort Lauderdale",
+    "state":    "FL",
+    "zip":      "33312"
   }
 }
