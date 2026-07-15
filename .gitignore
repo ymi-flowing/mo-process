@@ -6,7 +6,12 @@ Cardentials.txt
 
 # Runtime output
 out/
+out_test/
 *.log
+# One-off run artifacts (stdout from the runner + helper scripts).
+result.json
+send_result.json
+verify_result.json
 
 # Python
 __pycache__/

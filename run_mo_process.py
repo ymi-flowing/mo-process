@@ -120,6 +120,7 @@ DEFAULT_TEMPLATE = "***MO Docs Email"
 
 HERE = Path(__file__).parent.resolve()
 CLAIM_TEMPLATE = HERE / "Claim Form Example.Docx"
+PROPERTIES_FILE = HERE / "properties.json"
 
 # --- Docupost + GitHub Contents API defaults ---
 DOCUPOST_URL         = "https://app.docupost.com/api/1.1/wf/sendletter"
@@ -137,6 +138,65 @@ DEFAULT_SENDER = {
     "state":    "FL",
     "zip":      "33781",
 }
+
+
+# --------------------------- Properties directory --------------------------
+
+def _load_properties() -> dict:
+    """Load properties.json (property name -> config). Empty dict if missing."""
+    if not PROPERTIES_FILE.exists():
+        return {}
+    try:
+        return json.loads(PROPERTIES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"WARN: could not parse {PROPERTIES_FILE.name}: {e}", file=sys.stderr)
+        return {}
+
+
+PROPERTIES: dict = _load_properties()
+
+
+def resolve_property(payload: dict, signals: dict) -> tuple[str, dict, dict]:
+    """Return (property_name, property_config, signals).
+
+    Signals ({'proid': ..., 'nameMatches': [...]}) are captured elsewhere on
+    the resident detail page BEFORE navigation clobbers the header + MOR
+    anchor's data-href. Resolution order:
+      1. payload['property'] explicit override
+      2. proid match against PROPERTIES entries with a non-null proid
+      3. body-text name match against PROPERTIES keys (unique match required)
+    Raises RuntimeError if none of the above resolves.
+    """
+    log(f"Property signals: proid={signals.get('proid')} nameMatches={signals.get('nameMatches')}")
+
+    override = (payload or {}).get("property")
+    if override:
+        cfg = PROPERTIES.get(override)
+        if not cfg:
+            raise RuntimeError(f"payload.property={override!r} not in properties.json")
+        return override, cfg, signals
+
+    proid = signals.get("proid")
+    if proid:
+        for name, cfg in PROPERTIES.items():
+            if cfg.get("proid") and cfg["proid"].lower() == proid.lower():
+                return name, cfg, signals
+
+    matches = signals.get("nameMatches") or []
+    if len(matches) == 1:
+        name = matches[0]
+        return name, PROPERTIES[name], signals
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Ambiguous property: page text matched multiple DB entries: {matches}. "
+            f"Add proid to properties.json or set payload.property."
+        )
+
+    raise RuntimeError(
+        f"Could not resolve property. proid={proid} nameMatches={matches}. "
+        f"Add an entry to properties.json (and set proid={proid!r} if you have it) "
+        f"or pass payload.property."
+    )
 
 
 # ------------------------------ Utilities ----------------------------------
@@ -208,15 +268,40 @@ def login(page: Page):
 
 # ------------------------------ MOR steps ----------------------------------
 
-def open_move_out_rec(page: Page, lease_url: str) -> dict:
-    """Navigate to the resident detail and click the visible Move Out Rec. link."""
+def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | None = None) -> dict:
+    """Navigate to the resident detail and click the visible Move Out Rec. link.
+
+    Also captures property signals (proid + name matches) from the resident
+    detail page BEFORE clicking Move Out Rec., because the click navigates
+    away and the property header + MOR anchor's data-href both disappear.
+    Returns {'dataHref': ..., 'propertySignals': {'proid': ..., 'nameMatches': [...]}}.
+    """
     page.goto(lease_url, wait_until="domcontentloaded")
     # Wait for the sidebar's Move Out Rec. anchor to render.
     page.wait_for_function(
         "() => !!document.querySelector('#MoveOutReconciliationLink')",
         timeout=30000,
     )
-    log("Resident detail loaded; clicking Move Out Rec.")
+    log("Resident detail loaded; capturing property signals + clicking Move Out Rec.")
+
+    signals = page.evaluate(
+        r"""(known) => {
+          const out = { proid: null, nameMatches: [] };
+          const a = document.querySelector('#MoveOutReconciliationLink, #MoveOutReconciliationOpenLink');
+          if (a) {
+            const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
+            const m = href.match(/proid=([0-9a-fA-F-]{36})/);
+            if (m) out.proid = m[1];
+          }
+          const text = document.body.innerText || '';
+          for (const name of (known || [])) {
+            if (name && text.includes(name)) out.nameMatches.push(name);
+          }
+          return out;
+        }""",
+        known_property_names or [],
+    )
+
     info = page.evaluate(
         r"""() => {
           const a = document.querySelector('#MoveOutReconciliationLink');
@@ -224,6 +309,7 @@ def open_move_out_rec(page: Page, lease_url: str) -> dict:
           return { dataHref: a.getAttribute('data-href') };
         }"""
     )
+    info['propertySignals'] = signals
     # Wait for the MOR page to render its Move-out rec. date input.
     page.wait_for_function(
         "() => !!document.getElementById('MoveOutReconciliationDate')",
@@ -451,9 +537,16 @@ def generate_claim_form(
     forwarding: dict,
     totals: dict,
     charges: list,
+    property_config: dict | None = None,
 ) -> Path:
-    """Fill Claim Form Example.Docx with resident's data. Handles deposit vs no-deposit."""
+    """Fill Claim Form Example.Docx with resident's data. Handles deposit vs no-deposit.
+
+    When ``property_config`` is provided (from properties.json), the property's
+    return address (para 14) and Property Manager email (para 30) are rewritten
+    to match. Para 28 (Management Signature) is always set to "Property Management".
+    """
     from docx import Document
+    from docx.oxml.ns import qn
 
     if not CLAIM_TEMPLATE.exists():
         raise FileNotFoundError(f"Claim template missing: {CLAIM_TEMPLATE}")
@@ -488,6 +581,17 @@ def generate_claim_form(
         if not p.runs:
             p.add_run(text)
 
+    def set_paragraph_text(p, text):
+        # python-docx's `p.runs` does NOT enumerate text inside <w:hyperlink>
+        # children — so `force()` will leave a mailto: hyperlink intact and
+        # you get "<new email><old email>" doubled up. Strip everything under
+        # the paragraph except <w:pPr>, then add a fresh run.
+        pPr = p._element.find(qn('w:pPr'))
+        for child in list(p._element):
+            if child is not pPr:
+                p._element.remove(child)
+        p.add_run(text)
+
     force(paras[6],  f"Date: {date_str}")
     force(paras[8],  f"Resident(s) Name:    {resident_name}")
     force(paras[9],  f"Address: {street}")
@@ -499,6 +603,24 @@ def generate_claim_form(
     force(paras[21], f"Total Charges:                \t \t\t$ {money(total_charges)}")
     force(paras[23], f"Total Due:  Landlord to Resident:              \t$ {money(landlord_to_resident)}")
     force(paras[24], f"                     Resident to Landlord:           \t$ {money(resident_to_landlord)}")
+
+    if property_config:
+        prop_line = (
+            f"{property_config.get('address1', '')}, "
+            f"{property_config.get('city', '')}, "
+            f"{property_config.get('state', '')} "
+            f"{property_config.get('zip', '')}"
+        ).strip()
+        set_paragraph_text(paras[14], prop_line)
+        set_paragraph_text(
+            paras[30],
+            f"If you wish to dispute or disagree with any charges, you must submit "
+            f"your request via email to the Property Manager at: {property_config.get('email', '')}",
+        )
+
+    # Remove the "Management Signature" paragraph entirely — no signature line.
+    p28 = paras[28]
+    p28._element.getparent().remove(p28._element)
 
     d.save(dst)
     log(f"Wrote claim form: {dst}")
@@ -662,17 +784,21 @@ def _open_attachment_picker(page: Page):
 
 
 def _cancel_attachment_picker(page: Page):
-    """Close the ResMan attachments picker (Cancel button). Only affects
-    the top-most dialog, i.e. the picker itself."""
-    page.evaluate(
-        r"""() => {
-          const btns = Array.from(document.querySelectorAll('button'))
-            .filter(b => b.textContent.trim() === 'Cancel' && b.getBoundingClientRect().width>0);
-          // The topmost Cancel belongs to the attachments picker.
-          btns[0]?.click();
-        }"""
-    )
+    """Close the ResMan attachments picker via ESC, then verify the outer
+    email dialog is still open.
+
+    The earlier implementation clicked the topmost visible Cancel button. If
+    the picker had already auto-dismissed, that Cancel hit the OUTER email
+    dialog's Cancel — closing the whole compose. Every subsequent step
+    (set_from, click_send) then silently no-op'd via ``?.click()`` and the
+    runner logged "Email sent" without sending. Verified live (Luis Garcie
+    T135, 7/14/2026): first-attempt run's Comm Log had zero rows for the
+    intended send. ESC closes only the topmost modal; the verify raises so
+    a silent no-op path can never follow."""
+    page.keyboard.press("Escape")
     page.wait_for_timeout(600)
+    if not page.evaluate("() => !!document.getElementById('FromObject')"):
+        raise RuntimeError("attach picker close accidentally closed the outer email dialog")
 
 
 def _wait_picker_has_files(page: Page, filenames: list, timeout_ms: int):
@@ -781,19 +907,80 @@ def attach_from_resman(page: Page, filenames: list) -> list:
 
 
 def click_send(page: Page):
-    log("Clicking Send.")
-    page.evaluate(
+    """Click Send in the resident email dialog with hard preconditions:
+    the dialog must still be open (``#FromObject`` present) AND a visible
+    Send button must exist. Prevents the silent no-op mode where the outer
+    dialog was already closed by an earlier bug and ``?.click()`` did nothing
+    while ``wait_for_function(...FromObject gone)`` returned immediately."""
+    log("Verifying email dialog open before Send.")
+    state = page.evaluate(
         r"""() => {
-          const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'Send' && b.getBoundingClientRect().width>0);
-          btns[0]?.click();
+          if (!document.getElementById('FromObject')) return { ok: false, reason: 'email dialog closed (#FromObject missing)' };
+          const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'Send' && b.getBoundingClientRect().width > 0);
+          if (btns.length === 0) return { ok: false, reason: 'no visible Send button' };
+          btns[0].click();
+          return { ok: true, sendButtons: btns.length };
         }"""
     )
+    log(f"Send click state: {state}")
+    if not state.get("ok"):
+        raise RuntimeError(f"Send preconditions failed: {state}")
     # Wait for the Send Email dialog to close (FromObject gone from the DOM).
     page.wait_for_function(
         r"""() => !document.getElementById('FromObject')""",
         timeout=45000,
     )
-    log("Email sent.")
+    log("Email dialog closed after Send.")
+
+
+# ---------------------- Communication Log verification --------------------
+
+def verify_via_comm_log(page: Page, lease_url: str, subject_hint: str, wait_seconds: int = 10) -> dict:
+    """After Send: open the resident detail's Communication Log accordion,
+    wait long enough for its Kendo grid to lazy-hydrate, then look for a
+    row whose text contains today's subject (property name is enough).
+
+    Returns {"verified": bool, "row": <text|None>, "opened": bool}. Never
+    raises — the caller decides how to react (we downgrade status but do
+    not fail the run, since a slow grid can produce a false negative)."""
+    log(f"Verifying send via Communication Log (waiting {wait_seconds}s for Kendo grid to hydrate).")
+    out = {"verified": False, "row": None, "opened": False}
+    try:
+        page.goto(lease_url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            r"""() => !!document.querySelector('a[href^="mailto:"]')""",
+            timeout=30000,
+        )
+        opened = page.evaluate(
+            r"""() => {
+              const hdrs = Array.from(document.querySelectorAll('h3, .accordion-header, .k-header, button, a'));
+              const hdr = hdrs.find(h => (h.textContent || '').trim().startsWith('Communication Log'));
+              if (!hdr) return { ok: false, reason: 'no Communication Log header' };
+              hdr.scrollIntoView({ block: 'center' });
+              hdr.click();
+              return { ok: true };
+            }"""
+        )
+        out["opened"] = bool(opened.get("ok"))
+        page.wait_for_timeout(wait_seconds * 1000)
+        row = page.evaluate(
+            r"""(hint) => {
+              const trs = Array.from(document.querySelectorAll('tr'));
+              for (const tr of trs) {
+                const t = (tr.innerText || '').replace(/\s+/g, ' ').trim();
+                if (t.includes(hint) && t.includes('Email')) return t;
+              }
+              return null;
+            }""",
+            subject_hint,
+        )
+        if row:
+            out["verified"] = True
+            out["row"] = row
+    except Exception as e:
+        log(f"verify_via_comm_log soft-fail: {type(e).__name__}: {e}")
+    log(f"Comm Log verification: {out}")
+    return out
 
 
 # ------------------------------ Docupost ----------------------------------
@@ -937,11 +1124,15 @@ def resident_name_from_page(page: Page) -> str:
 
 
 def unit_number_from_page(page: Page) -> str:
+    """Return the resident's unit identifier preserving any letter prefix/suffix
+    (e.g. ``T135``, ``135``, ``135B``). Old form used ``/\\d+/`` which dropped
+    letters — T135 came out as 135 and cascaded into wrong filenames, ResMan
+    Documents naming, GitHub-hosted PDF path, and Docupost letter description."""
     return page.evaluate(
         r"""() => {
           const cells = Array.from(document.querySelectorAll('td'));
-          const cell = cells.find(c => c.textContent.trim().startsWith('Unit') && /\d/.test(c.textContent));
-          return cell ? (cell.textContent.match(/\d+/) || [''])[0] : '';
+          const cell = cells.find(c => /^Unit\s+[A-Za-z]*\d+[A-Za-z]*\b/.test(c.textContent.trim()));
+          return cell ? (cell.textContent.match(/^Unit\s+([A-Za-z]*\d+[A-Za-z]*)/) || ['',''])[1] : '';
         }"""
     )
 
@@ -1058,7 +1249,7 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         "endedAt": None,
         "durationSeconds": None,
         "resident": {
-            "name": None, "unit": None, "property": "49th St Apartments",
+            "name": None, "unit": None, "property": None,
             "leaseUrl": lease_url, "email": None,
         },
         "mor": {
@@ -1077,6 +1268,7 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             "attempted": email_enabled, "sent": False, "to": None,
             "from": from_pref, "template": template,
             "subject": None, "attachedByResMan": None,
+            "commLogVerified": None, "commLogRow": None,
         },
         "docupost": None,
         "github": {
@@ -1103,7 +1295,19 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         page = context.new_page()
 
         login(page)
-        open_move_out_rec(page, lease_url)
+        mor_info = open_move_out_rec(page, lease_url, known_property_names=list(PROPERTIES.keys()))
+
+        # Resolve which property this resident belongs to (drives Claim Form
+        # return address + email, Docupost sender, and result.resident.property).
+        prop_name, prop_cfg, prop_signals = resolve_property(payload, mor_info["propertySignals"])
+        log(f"Resolved property: {prop_name!r}")
+        result["resident"]["property"] = prop_name
+        result["property"] = {
+            "name":     prop_name,
+            "proid":    prop_signals.get("proid"),
+            "config":   prop_cfg,
+        }
+
         fill_mor_date(page, mor_date)
         for c in charges:
             add_charge(page,
@@ -1140,6 +1344,7 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             forwarding=fwd,
             totals=result["mor"]["totals"],
             charges=charges,
+            property_config=prop_cfg,
         )
         result["docs"]["claimForm"] = str(claim_form_path)
 
@@ -1191,6 +1396,19 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"
             click_send(page)
             result["email"]["sent"] = True
+
+            # Verify via Communication Log — the runner's "Email sent" log is
+            # not sufficient (see the T135 run 7/14/2026 where Send silently
+            # no-op'd but this same code path returned OK). One retry with
+            # longer wait if the first attempt sees nothing — Kendo grid can
+            # be slow to hydrate on small viewports.
+            subject_hint = result["email"]["subject"] or prop_name
+            comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=10)
+            if not comm["verified"]:
+                log("Comm Log verify miss; retrying with longer wait.")
+                comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=15)
+            result["email"]["commLogVerified"] = comm["verified"]
+            result["email"]["commLogRow"] = comm["row"]
         else:
             log("Email skipped (either --no-send or email.enabled=false).")
 
@@ -1212,6 +1430,8 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
                 resident_unit=result["resident"]["unit"],
                 forwarding=result["mor"]["forwardingAddress"] or {},
                 repo=result["github"]["repo"],
+                property_config=prop_cfg,
+                property_name=prop_name,
             )
         except Exception as e:
             log(f"Docupost step failed: {type(e).__name__}: {e}")
@@ -1226,7 +1446,14 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         log("Docupost skipped: docupost.enabled=false in payload.")
         result["docupost"] = {"skipped": "disabled_in_payload"}
 
-    result["status"] = "sent" if result["email"]["sent"] else ("parked" if not email_enabled else "sent_no_email")
+    if not result["email"]["sent"]:
+        result["status"] = "parked" if not email_enabled else "sent_no_email"
+    else:
+        # commLogVerified is None when verification wasn't run (email disabled)
+        # or True/False when it did run. Treat False as "we clicked Send but
+        # cannot confirm the message left ResMan" — same category as
+        # sent_no_email so downstream (n8n summary email) flags it.
+        result["status"] = "sent" if result["email"]["commLogVerified"] is not False else "sent_no_email"
     result["endedAt"] = now_iso()
     result["durationSeconds"] = int(time.time() - started)
     return result
@@ -1239,6 +1466,8 @@ def _maybe_send_docupost(
     resident_unit: str,
     forwarding: dict,
     repo: str,
+    property_config: dict | None = None,
+    property_name: str | None = None,
 ) -> dict:
     """Push the Combined PDF to the public repo, then hand its raw URL to
     Docupost's sendletter API. Returns the docupost result block or a
@@ -1264,8 +1493,19 @@ def _maybe_send_docupost(
     if not _wait_raw_url_live(raw_url):
         return {"skipped": "raw_url_not_live", "pdfUrl": raw_url}
 
-    # 2. Build sender + recipient dicts.
-    sender = { **DEFAULT_SENDER, **(cfg.get("sender") or {}) }
+    # 2. Build sender + recipient dicts. Property-directory config wins over
+    # DEFAULT_SENDER; explicit cfg.sender still wins over both.
+    prop_sender = {}
+    if property_config:
+        prop_sender = {
+            "name":     property_name or DEFAULT_SENDER["name"],
+            "address1": property_config.get("address1"),
+            "city":     property_config.get("city"),
+            "state":    property_config.get("state"),
+            "zip":      property_config.get("zip"),
+        }
+        prop_sender = {k: v for k, v in prop_sender.items() if v}
+    sender = { **DEFAULT_SENDER, **prop_sender, **(cfg.get("sender") or {}) }
 
     # Split "8400 49th Street North Apt. 1113" into street1 + optional apt.
     street = forwarding["street"]
@@ -1321,7 +1561,8 @@ def main():
             "docs":  {"claimForm": None, "fasPdf": None, "combinedPdf": None},
             "email": {"attempted": False, "sent": False, "to": None,
                       "from": None, "template": None, "subject": None,
-                      "attachedByResMan": None},
+                      "attachedByResMan": None,
+                      "commLogVerified": None, "commLogRow": None},
             "docupost": None,
             "github": {
                 "repo":   os.environ.get("GITHUB_REPOSITORY") or "ymi-flowing/mo-process",

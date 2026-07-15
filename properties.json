@@ -1,0 +1,18 @@
+{
+  "49th St Apartments": {
+    "proid":    "a262aa42-7393-4d84-9bf5-ae1bff852b32",
+    "email":    "pm@49streetapts.com",
+    "address1": "8400 49th Street N",
+    "city":     "Pinellas Park",
+    "state":    "FL",
+    "zip":      "33781"
+  },
+  "The Villas at Ortega": {
+    "proid":    null,
+    "email":    "pm@thevillasatortega.com",
+    "address1": "5327 Timuquana Rd",
+    "city":     "Jacksonville",
+    "state":    "FL",
+    "zip":      "32210"
+  }
+}

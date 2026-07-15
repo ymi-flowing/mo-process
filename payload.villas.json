@@ -1,0 +1,25 @@
+{
+  "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/01e37e4b-327e-42d6-8c6b-fd9b3b0ee799",
+  "charges": [
+    { "description": "Paint",             "amount": 800.00 },
+    { "description": "Basic unit clean",  "amount": 165.00 },
+    { "description": "Blind damages",     "amount":  20.00 },
+    { "description": "Trash removal",     "amount":  60.00 },
+    { "description": "Wall nails",        "amount":  40.00 },
+    { "description": "Carpet clean",      "amount": 150.00 }
+  ],
+  "morDate": null,
+  "email": {
+    "enabled": true,
+    "from": "property",
+    "template": "***MO Docs Email"
+  },
+  "docupost": {
+    "enabled": true,
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "color":        false,
+    "doublesided":  false
+  },
+  "outputDir": "out"
+}
