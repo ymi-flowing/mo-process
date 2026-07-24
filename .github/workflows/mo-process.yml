@@ -67,13 +67,26 @@ jobs:
           cat result.json
           exit 0
 
+      - name: Guarantee result.json exists for callback
+        if: ${{ always() && inputs.resume_url != '' }}
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ ! -s result.json ]; then
+            cat > result.json <<EOF
+          {"status":"error","error":{"type":"runner_crashed","message":"result.json missing or empty after runner exit — Python interpreter likely crashed before writing output."},"github":{"repo":"${{ github.repository }}","runUrl":"$RUN_URL"}}
+          EOF
+          fi
+
       - name: POST result back to n8n resume URL
-        if: ${{ inputs.resume_url != '' }}
+        if: ${{ always() && inputs.resume_url != '' }}
         env:
           RESUME_URL: ${{ inputs.resume_url }}
         run: |
           curl -sS -X POST \
             -H 'Content-Type: application/json' \
+            --retry 5 --retry-connrefused --retry-delay 3 \
+            --max-time 30 --fail-with-body \
             --data @result.json \
             "$RESUME_URL"
 

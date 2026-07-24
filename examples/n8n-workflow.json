@@ -59,8 +59,11 @@
     {
       "parameters": {
         "resume": "webhook",
+        "httpMethod": "POST",
         "options": {
-          "webhookSuffix": "callback"
+          "limitWaitTime": true,
+          "resumeAmount": 30,
+          "resumeUnit": "minutes"
         }
       },
       "id": "wait-callback",

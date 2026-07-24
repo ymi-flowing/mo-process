@@ -423,14 +423,27 @@ def approve_mor(page: Page):
 # --------------------------- Forwarding address ----------------------------
 
 def get_forwarding_address(page: Page) -> dict | None:
-    """Read forwarding address from the resident's Vacating Information block."""
+    """Read forwarding address from the resident's Vacating Information block.
+
+    ResMan renders the value as sibling block-level divs inside `.fv` (street /
+    "City, ST ZIP" / country). Naive `textContent` concatenates them with no
+    separator, producing e.g. "…24XJacksonville, FL 32210United States" — which
+    then defeats parse_address_lines(). Join the child blocks with '\\n' so the
+    CSZ regex has a clean line to match, same trick used by
+    get_unit_address_via_new_tab().
+    """
     raw = page.evaluate(
         r"""() => {
           const label = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim().startsWith('Forwarding address'));
           if (!label) return null;
           const cell = label.closest('td');
-          const val = cell?.querySelector('.fv');
-          return val ? val.textContent.trim() : null;
+          const val  = cell?.querySelector('.fv');
+          if (!val) return null;
+          const parts = Array.from(val.querySelectorAll('div, span'))
+            .map(el => el.textContent.trim())
+            .filter(t => t.length && t !== 'United States');
+          if (parts.length) return parts.join('\n');
+          return val.textContent.trim();
         }"""
     )
     if not raw:
