@@ -124,6 +124,8 @@ PROPERTIES_FILE = HERE / "properties.json"
 
 # --- Docupost + GitHub Contents API defaults ---
 DOCUPOST_URL         = "https://app.docupost.com/api/1.1/wf/sendletter"
+DOCUPOST_LOGIN_URL   = "https://app.docupost.com/login"
+DOCUPOST_LETTER_URL  = "https://app.docupost.com/letter/{letter_id}"
 DOCUPOST_EXAMPLES    = "examples"     # path prefix in the repo where Move Out Docs PDFs land
 DOCUPOST_DEFAULTS = {
     "class":        "usps_first_class",
@@ -131,6 +133,7 @@ DOCUPOST_DEFAULTS = {
     "color":        False,
     "doublesided":  False,
 }
+CERT_FILENAME        = "MO Docs - Mail Certification.png"
 DEFAULT_SENDER = {
     "name":     "49th St Apartments",
     "address1": "8400 49th Street N",
@@ -1125,6 +1128,104 @@ def send_via_docupost(cfg: dict, sender: dict, recipient: dict, pdf_url: str, to
     }
 
 
+def _load_docupost_web_creds() -> tuple[str | None, str | None]:
+    """Resolve Docupost dashboard credentials. Env wins over Cardentials.txt
+    so CI can override with GitHub Secrets; local dev falls back to the file."""
+    user = os.environ.get("DOCUPOST_WEB_USER")
+    pw   = os.environ.get("DOCUPOST_WEB_PASS")
+    if user and pw:
+        return user, pw
+    cred_file = HERE / "Cardentials.txt"
+    if not cred_file.exists():
+        return user, pw
+    try:
+        text = cred_file.read_text(encoding="utf-8")
+    except Exception:
+        return user, pw
+    m = re.search(r"Docupost Web Login.*?Username:\s*(\S+).*?Password:\s*(\S+)", text, re.S | re.I)
+    if not m:
+        return user, pw
+    return user or m.group(1).strip(), pw or m.group(2).strip()
+
+
+def capture_docupost_certification(
+    browser,
+    letter_id: str,
+    out_dir: Path,
+    web_user: str,
+    web_pass: str,
+    poll_seconds: int = 90,
+) -> tuple[Path | None, str | None]:
+    """Log into the Docupost dashboard, open the letter, wait for the USPS
+    tracking # to render, and screenshot the middle panel (delivery status +
+    order summary + recipient + sender) to `out_dir/MO Docs - Mail
+    Certification.png`. Returns (path, tracking_number) — either may be None
+    on soft failure. NEVER raises; callers log and move on."""
+    from playwright.sync_api import Error as PWError
+    cert_path = out_dir / CERT_FILENAME
+    context = browser.new_context(viewport={"width": 1400, "height": 1200})
+    try:
+        page = context.new_page()
+        page.goto(DOCUPOST_LETTER_URL.format(letter_id=letter_id), wait_until="domcontentloaded")
+        # Login page redirect: fill and submit.
+        try:
+            page.get_by_role("textbox", name="Email").fill(web_user, timeout=10000)
+            page.get_by_role("textbox", name="Password").fill(web_pass)
+            page.get_by_role("button", name="Log in").click()
+        except PWError as e:
+            log(f"Docupost login form not found (already logged in?): {e}")
+        # Wait for either the tracking # or a bounded timeout — whichever first.
+        tracking = None
+        deadline = time.time() + poll_seconds
+        while time.time() < deadline:
+            tracking = page.evaluate(
+                r"""() => {
+                  const m = (document.body.innerText || '').match(/USPS Tracking #\s*(\d{18,})/);
+                  return m ? m[1] : null;
+                }"""
+            )
+            if tracking:
+                break
+            page.wait_for_timeout(2000)
+        if tracking:
+            log(f"Docupost tracking #: {tracking}")
+        else:
+            log(f"Docupost tracking # not visible after {poll_seconds}s — screenshotting current state.")
+        # Give the delivery card a beat to finish rendering.
+        page.wait_for_timeout(500)
+        # Screenshot the smallest container that includes both 'Delivery Status'
+        # and 'Sender' text (excludes PDF preview iframe + app nav sidebar).
+        # The Bubble.io DOM has no stable classes so we discover it dynamically.
+        panel_handle = page.evaluate_handle(
+            r"""() => {
+              const divs = Array.from(document.querySelectorAll('div'));
+              const del  = divs.find(d => Array.from(d.childNodes).some(n =>
+                n.nodeType === Node.TEXT_NODE && n.textContent.trim() === 'Delivery Status'));
+              if (!del) return null;
+              let el = del;
+              while (el && !el.textContent.includes('Sender')) el = el.parentElement;
+              return el;
+            }"""
+        )
+        element = panel_handle.as_element() if panel_handle else None
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        if element:
+            element.screenshot(path=str(cert_path))
+        else:
+            log("Docupost middle panel selector missed — falling back to viewport screenshot.")
+            page.screenshot(path=str(cert_path))
+        log(f"Saved Docupost certification: {cert_path}")
+        return cert_path, tracking
+    except Exception as e:
+        log(f"Docupost certification capture failed: {type(e).__name__}: {e}")
+        return None, None
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+
+
 # ------------------------------ Runner main --------------------------------
 
 def resident_name_from_page(page: Page) -> str:
@@ -1425,39 +1526,84 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         else:
             log("Email skipped (either --no-send or email.enabled=false).")
 
+        # ------- Docupost step (INSIDE the browser block) -------
+        # Moved inside so that after sendletter succeeds we can still upload
+        # the mail-certification screenshot back to the resident's Documents
+        # tab (needs the ResMan `page` context alive). Runs unless the caller
+        # explicitly opts out with docupost.enabled=false — an absent block
+        # still means "please try", matching how the Fillout form dispatches.
+        dp_cfg = payload.get("docupost") or {}
+        dp_enabled = dp_cfg.get("enabled") is not False
+        if dp_enabled and result["email"]["sent"] and combined:
+            try:
+                result["docupost"] = _maybe_send_docupost(
+                    cfg=dp_cfg,
+                    combined_pdf=combined,
+                    resident_name=result["resident"]["name"],
+                    resident_unit=result["resident"]["unit"],
+                    forwarding=result["mor"]["forwardingAddress"] or {},
+                    repo=result["github"]["repo"],
+                    property_config=prop_cfg,
+                    property_name=prop_name,
+                )
+            except Exception as e:
+                log(f"Docupost step failed: {type(e).__name__}: {e}")
+                result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
+        elif dp_enabled and not result["email"]["sent"]:
+            log("Docupost skipped: resident email was not sent.")
+            result["docupost"] = {"skipped": "resident_email_not_sent"}
+        elif dp_enabled and not combined:
+            log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
+            result["docupost"] = {"skipped": "no_combined_pdf"}
+        else:
+            log("Docupost skipped: docupost.enabled=false in payload.")
+            result["docupost"] = {"skipped": "disabled_in_payload"}
+
+        # ------- Mail certification screenshot -> ResMan Documents -------
+        # If sendletter succeeded, log into the Docupost dashboard, screenshot
+        # the delivery-status card (with USPS tracking #), and upload it back
+        # to the resident's Documents. Any failure is soft — the letter is
+        # already in flight and we never want cert capture to abort the run.
+        cert_uploaded, cert_tracking, cert_error = False, None, None
+        letter_id = (result["docupost"] or {}).get("letterId")
+        if letter_id:
+            web_user, web_pass = _load_docupost_web_creds()
+            if not (web_user and web_pass):
+                cert_error = "no_docupost_web_creds"
+                log("Docupost cert skipped: DOCUPOST_WEB_USER/PASS not set (env or Cardentials.txt).")
+            else:
+                try:
+                    cert_path, cert_tracking = capture_docupost_certification(
+                        browser=browser,
+                        letter_id=letter_id,
+                        out_dir=out_dir,
+                        web_user=web_user,
+                        web_pass=web_pass,
+                    )
+                    if cert_path and cert_path.exists():
+                        try:
+                            upload_document(page, cert_path)
+                            cert_uploaded = True
+                        except Exception as e:
+                            cert_error = f"upload_failed: {type(e).__name__}: {e}"
+                            log(f"Docupost cert upload to ResMan failed: {e}")
+                    else:
+                        cert_error = "screenshot_failed"
+                except Exception as e:
+                    cert_error = f"{type(e).__name__}: {e}"
+                    log(f"Docupost cert capture crashed: {e}")
+            result["docupost"] = {
+                **(result["docupost"] or {}),
+                "certification": {
+                    "uploaded": cert_uploaded,
+                    "path":     str(out_dir / CERT_FILENAME) if cert_uploaded else None,
+                    "tracking": cert_tracking,
+                    "error":    cert_error,
+                },
+            }
+
         context.close()
         browser.close()
-
-    # ------- Docupost step -------
-    # Runs unless the caller explicitly opts out with docupost.enabled=false.
-    # An absent block still means "please try" — matches the way the process
-    # is actually used (Fillout form doesn't send a docupost block).
-    dp_cfg = payload.get("docupost") or {}
-    dp_enabled = dp_cfg.get("enabled") is not False   # None / True / missing → try
-    if dp_enabled and result["email"]["sent"] and combined:
-        try:
-            result["docupost"] = _maybe_send_docupost(
-                cfg=dp_cfg,
-                combined_pdf=combined,
-                resident_name=result["resident"]["name"],
-                resident_unit=result["resident"]["unit"],
-                forwarding=result["mor"]["forwardingAddress"] or {},
-                repo=result["github"]["repo"],
-                property_config=prop_cfg,
-                property_name=prop_name,
-            )
-        except Exception as e:
-            log(f"Docupost step failed: {type(e).__name__}: {e}")
-            result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
-    elif dp_enabled and not result["email"]["sent"]:
-        log("Docupost skipped: resident email was not sent.")
-        result["docupost"] = {"skipped": "resident_email_not_sent"}
-    elif dp_enabled and not combined:
-        log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
-        result["docupost"] = {"skipped": "no_combined_pdf"}
-    else:
-        log("Docupost skipped: docupost.enabled=false in payload.")
-        result["docupost"] = {"skipped": "disabled_in_payload"}
 
     if not result["email"]["sent"]:
         result["status"] = "parked" if not email_enabled else "sent_no_email"

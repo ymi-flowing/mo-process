@@ -51,10 +51,12 @@ jobs:
       - name: Run MO Process
         id: run
         env:
-          RESMAN_USER:    ${{ secrets.RESMAN_USER }}
-          RESMAN_PASS:    ${{ secrets.RESMAN_PASS }}
-          DOCUPOST_TOKEN: ${{ secrets.DOCUPOST_TOKEN }}
-          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          RESMAN_USER:       ${{ secrets.RESMAN_USER }}
+          RESMAN_PASS:       ${{ secrets.RESMAN_PASS }}
+          DOCUPOST_TOKEN:    ${{ secrets.DOCUPOST_TOKEN }}
+          DOCUPOST_WEB_USER: ${{ secrets.DOCUPOST_WEB_USER }}
+          DOCUPOST_WEB_PASS: ${{ secrets.DOCUPOST_WEB_PASS }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           echo '${{ inputs.payload }}' > payload.json
