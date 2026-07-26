@@ -428,12 +428,14 @@ def approve_mor(page: Page):
 def get_forwarding_address(page: Page) -> dict | None:
     """Read forwarding address from the resident's Vacating Information block.
 
-    ResMan renders the value as sibling block-level divs inside `.fv` (street /
-    "City, ST ZIP" / country). Naive `textContent` concatenates them with no
-    separator, producing e.g. "…24XJacksonville, FL 32210United States" — which
-    then defeats parse_address_lines(). Join the child blocks with '\\n' so the
-    CSZ regex has a clean line to match, same trick used by
-    get_unit_address_via_new_tab().
+    ResMan renders the value in two known shapes: (a) sibling block-level divs
+    inside `.fv` (street / "City, ST ZIP" / country), and (b) plain text nodes
+    separated by <br> (e.g. "7501 ULMERTON RD APT 2314<br>largo, FL 33771").
+    `textContent` collapses both — producing e.g. "…2314largo, FL 33771" — and
+    defeats parse_address_lines()'s CSZ regex. `innerText` respects both block
+    boundaries AND <br>, giving us the right line-broken string for either
+    shape. Prefer innerText and only fall back to textContent if empty (some
+    non-visible cases).
     """
     raw = page.evaluate(
         r"""() => {
@@ -442,11 +444,9 @@ def get_forwarding_address(page: Page) -> dict | None:
           const cell = label.closest('td');
           const val  = cell?.querySelector('.fv');
           if (!val) return null;
-          const parts = Array.from(val.querySelectorAll('div, span'))
-            .map(el => el.textContent.trim())
-            .filter(t => t.length && t !== 'United States');
-          if (parts.length) return parts.join('\n');
-          return val.textContent.trim();
+          const it = (val.innerText || '').trim();
+          if (it) return it;
+          return (val.textContent || '').trim();
         }"""
     )
     if not raw:
