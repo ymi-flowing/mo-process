@@ -426,32 +426,90 @@ def approve_mor(page: Page):
 # --------------------------- Forwarding address ----------------------------
 
 def get_forwarding_address(page: Page) -> dict | None:
-    """Read forwarding address from the resident's Vacating Information block.
+    """Read forwarding address by opening the Lease Edit dialog.
 
-    ResMan renders the value in two known shapes: (a) sibling block-level divs
-    inside `.fv` (street / "City, ST ZIP" / country), and (b) plain text nodes
-    separated by <br> (e.g. "7501 ULMERTON RD APT 2314<br>largo, FL 33771").
-    `textContent` collapses both — producing e.g. "…2314largo, FL 33771" — and
-    defeats parse_address_lines()'s CSZ regex. `innerText` respects both block
-    boundaries AND <br>, giving us the right line-broken string for either
-    shape. Prefer innerText and only fall back to textContent if empty (some
-    non-visible cases).
+    Previously we screen-scraped the read-only "Forwarding address" cell,
+    which ResMan renders in at least two DOM shapes (sibling divs / plain
+    text with <br>) that collapsed under textContent and defeated the CSZ
+    regex. The Edit dialog exposes the raw structured fields on stable ids:
+
+      ForwardingAddress_StreetAddress  (textarea)
+      ForwardingAddress_City
+      ForwardingAddress_State
+      ForwardingAddress_Zip
+      ForwardingAddress_Country
+
+    Zero parsing needed. We open the Lease-widget's Edit button, read the
+    values, then close the dialog with its X (never Save). Returns None if
+    the dialog can't be opened or every field is blank (caller falls back
+    to the unit address).
     """
-    raw = page.evaluate(
+    opened = page.evaluate(
         r"""() => {
-          const label = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim().startsWith('Forwarding address'));
-          if (!label) return null;
-          const cell = label.closest('td');
-          const val  = cell?.querySelector('.fv');
-          if (!val) return null;
-          const it = (val.innerText || '').trim();
-          if (it) return it;
-          return (val.textContent || '').trim();
+          const label = Array.from(document.querySelectorAll('label'))
+            .find(l => l.textContent.trim().startsWith('Forwarding address'));
+          if (!label) return false;
+          // Walk up until we find a container that also holds the Lease
+          // widget's Edit button (class 'dialog-form-link').
+          let node = label;
+          while (node && !(node.querySelector && node.querySelector('button.dialog-form-link'))) {
+            node = node.parentElement;
+          }
+          const btn = node && node.querySelector('button.dialog-form-link');
+          if (!btn) return false;
+          btn.click();
+          return true;
         }"""
     )
-    if not raw:
+    if not opened:
+        log("Forwarding: could not find Lease Edit button.")
         return None
-    return parse_address_lines(raw)
+    try:
+        # Wait for the ForwardingAddress fields to render inside the newly
+        # opened Lease dialog.
+        page.wait_for_selector('#ForwardingAddress_StreetAddress', timeout=15000)
+        vals = page.evaluate(
+            r"""() => {
+              const g = id => (document.getElementById(id)?.value || '').trim();
+              return {
+                street:  g('ForwardingAddress_StreetAddress'),
+                city:    g('ForwardingAddress_City'),
+                state:   g('ForwardingAddress_State'),
+                zip:     g('ForwardingAddress_Zip'),
+                country: g('ForwardingAddress_Country'),
+              };
+            }"""
+        )
+    except PWTimeout:
+        log("Forwarding: Lease Edit dialog opened but fields never rendered.")
+        vals = None
+    finally:
+        # Always close via the dialog's X (never Save) so we don't mutate
+        # ResMan state. Robust against multiple stacked dialogs — we always
+        # close the most recently opened visible ui-dialog.
+        page.evaluate(
+            r"""() => {
+              const dialogs = Array.from(document.querySelectorAll('.ui-dialog'))
+                .filter(d => d.getBoundingClientRect().width > 0);
+              const d = dialogs[dialogs.length - 1];
+              d?.querySelector('.ui-dialog-titlebar-close')?.click();
+            }"""
+        )
+    if not vals or not vals.get("street"):
+        return None
+    unit_no = None
+    m = re.search(r"\b(?:unit|apt|apartment|#)\s*([A-Za-z0-9\-]+)", vals["street"], re.I)
+    if m:
+        unit_no = m.group(1)
+    return {
+        "street":  vals["street"],
+        "unitNo":  unit_no,
+        "city":    vals["city"]  or None,
+        "state":   vals["state"] or None,
+        "zip":     vals["zip"]   or None,
+        "county":  None,
+        "country": vals["country"] or None,
+    }
 
 
 def parse_address_lines(text: str) -> dict:
