@@ -1225,23 +1225,61 @@ def capture_docupost_certification(
     try:
         page = context.new_page()
         page.goto(DOCUPOST_LETTER_URL.format(letter_id=letter_id), wait_until="domcontentloaded")
-        # Login page redirect: fill and submit.
+        # Docupost either (a) 302s to /login, or (b) already-logged-in
+        # session lands us straight on the letter page. Detect which by
+        # racing the login-form Email field against the 'Delivery Status'
+        # text — whichever appears first wins.
         try:
-            page.get_by_role("textbox", name="Email").fill(web_user, timeout=10000)
-            page.get_by_role("textbox", name="Password").fill(web_pass)
-            page.get_by_role("button", name="Log in").click()
+            page.wait_for_function(
+                r"""() => {
+                  const hasLogin = !!Array.from(document.querySelectorAll('input'))
+                    .find(i => (i.placeholder || i.name || '').toLowerCase().includes('email'));
+                  const hasLetter = (document.body.innerText || '').includes('Delivery Status');
+                  return hasLogin || hasLetter;
+                }""",
+                timeout=20000,
+            )
         except PWError as e:
-            log(f"Docupost login form not found (already logged in?): {e}")
-        # Wait for either the tracking # or a bounded timeout — whichever first.
+            log(f"Docupost: neither login form nor letter page rendered: {e}")
+        # If it's the login page, fill and submit, then wait for the
+        # post-login redirect to complete BEFORE we start polling. Not
+        # waiting is what caused the "Execution context was destroyed"
+        # race in run 30277568782.
+        try:
+            email_box = page.get_by_role("textbox", name="Email")
+            if email_box.count() > 0 and email_box.first.is_visible():
+                email_box.first.fill(web_user, timeout=10000)
+                page.get_by_role("textbox", name="Password").fill(web_pass)
+                page.get_by_role("button", name="Log in").click()
+                # Wait for the letter page to actually render post-login.
+                # networkidle is best-effort; the Delivery Status text is the
+                # authoritative signal that we're on the right page and JS
+                # rendering has completed.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except PWError:
+                    pass
+                page.wait_for_function(
+                    r"""() => (document.body.innerText || '').includes('Delivery Status')""",
+                    timeout=20000,
+                )
+        except PWError as e:
+            log(f"Docupost login step issue (continuing): {e}")
+        # Poll for the tracking #. Each iteration is wrapped so a transient
+        # nav (Bubble.io does async rerenders) doesn't blow up the loop.
         tracking = None
         deadline = time.time() + poll_seconds
         while time.time() < deadline:
-            tracking = page.evaluate(
-                r"""() => {
-                  const m = (document.body.innerText || '').match(/USPS Tracking #\s*(\d{18,})/);
-                  return m ? m[1] : null;
-                }"""
-            )
+            try:
+                tracking = page.evaluate(
+                    r"""() => {
+                      const m = (document.body.innerText || '').match(/USPS Tracking #\s*(\d{18,})/);
+                      return m ? m[1] : null;
+                    }"""
+                )
+            except PWError as e:
+                log(f"Docupost poll iteration transient error (retrying): {e}")
+                tracking = None
             if tracking:
                 break
             page.wait_for_timeout(2000)
@@ -1254,21 +1292,33 @@ def capture_docupost_certification(
         # Screenshot the smallest container that includes both 'Delivery Status'
         # and 'Sender' text (excludes PDF preview iframe + app nav sidebar).
         # The Bubble.io DOM has no stable classes so we discover it dynamically.
-        panel_handle = page.evaluate_handle(
-            r"""() => {
-              const divs = Array.from(document.querySelectorAll('div'));
-              const del  = divs.find(d => Array.from(d.childNodes).some(n =>
-                n.nodeType === Node.TEXT_NODE && n.textContent.trim() === 'Delivery Status'));
-              if (!del) return null;
-              let el = del;
-              while (el && !el.textContent.includes('Sender')) el = el.parentElement;
-              return el;
-            }"""
-        )
-        element = panel_handle.as_element() if panel_handle else None
+        # Retry once on transient nav — Bubble.io re-renders sporadically.
         cert_path.parent.mkdir(parents=True, exist_ok=True)
+        element = None
+        for attempt in range(2):
+            try:
+                panel_handle = page.evaluate_handle(
+                    r"""() => {
+                      const divs = Array.from(document.querySelectorAll('div'));
+                      const del  = divs.find(d => Array.from(d.childNodes).some(n =>
+                        n.nodeType === Node.TEXT_NODE && n.textContent.trim() === 'Delivery Status'));
+                      if (!del) return null;
+                      let el = del;
+                      while (el && !el.textContent.includes('Sender')) el = el.parentElement;
+                      return el;
+                    }"""
+                )
+                element = panel_handle.as_element() if panel_handle else None
+                break
+            except PWError as e:
+                log(f"Docupost panel handle transient error attempt {attempt+1}: {e}")
+                page.wait_for_timeout(1500)
         if element:
-            element.screenshot(path=str(cert_path))
+            try:
+                element.screenshot(path=str(cert_path))
+            except PWError as e:
+                log(f"Element screenshot failed, falling back to viewport: {e}")
+                page.screenshot(path=str(cert_path))
         else:
             log("Docupost middle panel selector missed — falling back to viewport screenshot.")
             page.screenshot(path=str(cert_path))
