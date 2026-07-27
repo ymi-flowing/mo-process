@@ -1212,7 +1212,7 @@ def capture_docupost_certification(
     out_dir: Path,
     web_user: str,
     web_pass: str,
-    poll_seconds: int = 90,
+    poll_seconds: int = 180,
 ) -> tuple[Path | None, str | None]:
     """Log into the Docupost dashboard, open the letter, wait for the USPS
     tracking # to render, and screenshot the middle panel (delivery status +
@@ -1289,27 +1289,36 @@ def capture_docupost_certification(
             log(f"Docupost tracking # not visible after {poll_seconds}s — screenshotting current state.")
         # Give the delivery card a beat to finish rendering.
         page.wait_for_timeout(500)
-        # Screenshot the smallest container that includes both 'Delivery Status'
-        # and 'Sender' text (excludes PDF preview iframe + app nav sidebar).
-        # The Bubble.io DOM has no stable classes so we discover it dynamically.
-        # Retry once on transient nav — Bubble.io re-renders sporadically.
+        # Screenshot the smallest .bubble-element.Group that contains all of
+        # 'Delivery Status' + 'Recipient' + 'Sender'. Bubble.io wraps every
+        # visual container in .bubble-element.Group, so picking the smallest
+        # matching one gives us the exact middle-content column — reliably,
+        # unlike the old text-node walker that failed when Bubble injected
+        # spans around the label. Verified against live letter 2026-07-27.
         cert_path.parent.mkdir(parents=True, exist_ok=True)
         element = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 panel_handle = page.evaluate_handle(
                     r"""() => {
-                      const divs = Array.from(document.querySelectorAll('div'));
-                      const del  = divs.find(d => Array.from(d.childNodes).some(n =>
-                        n.nodeType === Node.TEXT_NODE && n.textContent.trim() === 'Delivery Status'));
-                      if (!del) return null;
-                      let el = del;
-                      while (el && !el.textContent.includes('Sender')) el = el.parentElement;
-                      return el;
+                      const groups = Array.from(document.querySelectorAll('.bubble-element.Group'));
+                      const matches = groups.filter(g => {
+                        const t = g.innerText || '';
+                        return t.includes('Delivery Status')
+                            && t.includes('Recipient')
+                            && t.includes('Sender');
+                      });
+                      if (!matches.length) return null;
+                      matches.sort((a, b) => (a.innerText.length - b.innerText.length));
+                      return matches[0];
                     }"""
                 )
                 element = panel_handle.as_element() if panel_handle else None
-                break
+                if element:
+                    break
+                # No match yet — the letter shell may still be rendering.
+                log(f"Docupost panel not found on attempt {attempt+1}; waiting 3s.")
+                page.wait_for_timeout(3000)
             except PWError as e:
                 log(f"Docupost panel handle transient error attempt {attempt+1}: {e}")
                 page.wait_for_timeout(1500)
@@ -1690,6 +1699,15 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
                     )
                     if cert_path and cert_path.exists():
                         try:
+                            # verify_via_comm_log opens the Communication Log
+                            # accordion, which hides the Documents section and
+                            # its button.add-files button. Navigate back to
+                            # the resident lease page so the upload button is
+                            # visible again before calling upload_document.
+                            page.goto(lease_url, wait_until="domcontentloaded")
+                            page.wait_for_selector(
+                                "button.add-files", state="visible", timeout=30000,
+                            )
                             upload_document(page, cert_path)
                             cert_uploaded = True
                         except Exception as e:
