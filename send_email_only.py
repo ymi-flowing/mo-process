@@ -72,7 +72,7 @@ def verify_via_comm_log(page, lease_url, subject_hint):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload", required=True, help="JSON, '@file', or '-' for stdin")
-    ap.add_argument("--attachment", help="Merged PDF filename in ResMan Documents (default: 'Move Out Docs - Unit <#>.pdf')")
+    ap.add_argument("--attachment", help="Local merged PDF path (default: '<outputDir>/Move Out Docs - Unit <#>.pdf')")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="Skip the final Send click")
     args = ap.parse_args()
@@ -103,15 +103,23 @@ def main():
             )
 
             unit = mo.unit_number_from_page(page)
-            attachment_name = args.attachment or f"Move Out Docs - Unit {unit}.pdf"
-            result["attachment"] = attachment_name
-            mo.log(f"Target attachment: {attachment_name}")
+            out_dir = Path(payload.get("outputDir") or (Path(__file__).parent / "out"))
+            if args.attachment:
+                attachment_path = Path(args.attachment)
+                if not attachment_path.is_absolute():
+                    attachment_path = out_dir / attachment_path
+            else:
+                attachment_path = out_dir / f"Move Out Docs - Unit {unit}.pdf"
+            if not attachment_path.exists():
+                raise RuntimeError(f"attachment not found on disk: {attachment_path}")
+            result["attachment"] = str(attachment_path)
+            mo.log(f"Target attachment: {attachment_path}")
 
             mo.open_send_email_dialog(page)
             mo.set_from(page, from_pref)
             mo.apply_template(page, template)
             mo.set_from(page, from_pref)  # template can reset From
-            attach_result = mo.attach_from_resman(page, [attachment_name])
+            attach_result = mo.attach_via_computer(page, [attachment_path])
             mo.log(f"Attach result: {attach_result}")
 
             # After attach, the email dialog might have been unexpectedly

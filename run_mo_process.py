@@ -941,227 +941,101 @@ def apply_template(page: Page, template_name: str):
     )
 
 
-def _open_attachment_picker(page: Page):
-    """Click Add → Add from ResMan in the email dialog. Waits for the picker
-    to render at least one document row."""
-    page.evaluate(
-        r"""() => {
-          document.getElementById('Add')?.click();
-        }"""
-    )
-    page.wait_for_timeout(400)
-    page.evaluate(
-        r"""() => {
-          document.getElementById('btnAddFromCloud')?.click();
-        }"""
-    )
+def attach_via_computer(page: Page, file_paths: list) -> list:
+    """Attach local file(s) to the currently open Send Email dialog via
+    ResMan's 'Add > Add from computer' path. This opens a NESTED modal
+    ('Add From Computer') containing a file input + Show-in-resident-portal
+    toggle + residents-share picker + Ok button — it is NOT a native OS
+    file chooser, so Playwright's `expect_file_chooser` never fires.
+
+    Flow (verified 2026-08-04 for RANDALL HUBERTY):
+      1. Click #Add → dropdown appears
+      2. Click #btnAddFromComputer → nested 'Add From Computer' modal opens
+      3. Set files on the <input type="file"> inside the modal
+      4. Ensure 'Show in resident portal' is UNCHECKED (matches API default)
+      5. Click Ok in the modal → modal closes, file attached to outer dialog
+    """
+    log(f"Attach via Add-from-Computer: {[p.name for p in file_paths]}")
+
+    # 1 + 2: open the dropdown, then the modal.
+    page.locator('#Add').click()
+    page.wait_for_timeout(500)
+    page.locator('#btnAddFromComputer').click()
+
+    # 3: wait for the nested modal (title == "Add From Computer") to be present.
     page.wait_for_function(
-        r"""() => !!document.querySelector('.document-name, .doc-name')""",
+        r"""() => {
+          const dialogs = Array.from(document.querySelectorAll('.ui-dialog'));
+          return dialogs.some(d =>
+            (d.querySelector('.ui-dialog-title')?.textContent || '').trim() === 'Add From Computer'
+            && d.getBoundingClientRect().width > 0
+          );
+        }""",
         timeout=15000,
     )
 
+    # 4: find the file input INSIDE that modal, set files on it.
+    file_input_selector = 'input[type="file"][name*="Documents"][name*="File"]'
+    file_input = page.locator(file_input_selector).first
+    file_input.wait_for(state="attached", timeout=10000)
+    file_input.set_input_files([str(p) for p in file_paths])
 
-def _cancel_attachment_picker(page: Page):
-    """Close the ResMan attachments picker via ESC, then verify the outer
-    email dialog is still open.
-
-    The earlier implementation clicked the topmost visible Cancel button. If
-    the picker had already auto-dismissed, that Cancel hit the OUTER email
-    dialog's Cancel — closing the whole compose. Every subsequent step
-    (set_from, click_send) then silently no-op'd via ``?.click()`` and the
-    runner logged "Email sent" without sending. Verified live (Luis Garcie
-    T135, 7/14/2026): first-attempt run's Comm Log had zero rows for the
-    intended send. ESC closes only the topmost modal; the verify raises so
-    a silent no-op path can never follow."""
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(600)
-    if not page.evaluate("() => !!document.getElementById('FromObject')"):
-        raise RuntimeError("attach picker close accidentally closed the outer email dialog")
-
-
-def _wait_picker_has_files(page: Page, filenames: list, timeout_ms: int):
-    """Wait until every requested filename is rendered as a .document-name
-    in the currently-open attachments picker. Raises PWTimeout on miss."""
-    page.wait_for_function(
-        r"""(names) => {
-          const rendered = Array.from(document.querySelectorAll('.document-name, .doc-name'))
-            .map(el => el.textContent.trim());
-          return names.every(n => rendered.includes(n));
-        }""",
-        arg=filenames,
-        timeout=timeout_ms,
-    )
-
-
-def _expand_folder_in_picker(page: Page, folder_display_name: str) -> bool:
-    """Click a `.folder-name` in the ResMan attachments picker to expand it,
-    revealing the file rows + their checkboxes. Idempotent. Returns True if
-    a folder with the given display name was found and clicked."""
-    return page.evaluate(
-        r"""(want) => {
-          const el = Array.from(document.querySelectorAll('.folder-name'))
-            .find(x => x.textContent.trim() === want);
-          if (!el) return false;
-          el.scrollIntoView({ block: 'center' });
-          el.click();
-          return true;
-        }""",
-        folder_display_name,
-    )
-
-
-def _check_files_in_picker(page: Page, filenames: list) -> list:
-    """Tick the checkbox next to each filename in the visible picker.
-    Returns [{name, checked, missing?}, ...]."""
-    return page.evaluate(
-        r"""(names) => {
-          const results = [];
-          names.forEach(name => {
-            const els = Array.from(document.querySelectorAll('.document-name, span, div'))
-              .filter(el => el.textContent.trim() === name && el.children.length === 0);
-            for (const el of els) {
-              const row = el.closest('.document-row-grid');
-              if (!row) continue;
-              const cb = row.querySelector('input[type="checkbox"]');
-              if (cb && cb.getBoundingClientRect().width > 0) {
-                if (!cb.checked) cb.click();
-                results.push({ name, checked: cb.checked });
-                return;
-              }
-            }
-            results.push({ name, checked: false, missing: true });
-          });
-          return results;
-        }""",
-        filenames,
-    )
-
-
-def _attach_from_computer(page: Page, file_paths: list) -> None:
-    """Fallback attach path when the ResMan picker doesn't surface our file:
-    click 'Add' → 'Add from computer', pick the local file(s) via the file
-    chooser. Used only when API-uploaded files aren't discoverable in the
-    picker after folder expand + retries. Raises if the dropdown menu item
-    can't be found — caller decides how to react."""
-    log(f"Attaching via 'Add from Computer' (fallback): {[p.name for p in file_paths]}")
-    with page.expect_file_chooser() as fc_info:
-        page.evaluate(
-            r"""() => {
-              document.getElementById('Add')?.click();
-            }"""
-        )
-        page.wait_for_timeout(400)
-        # 'Add from computer' menu item — the dropdown renders it as a
-        # visible link/button next to 'btnAddFromCloud'.
-        page.evaluate(
-            r"""() => {
-              const cands = Array.from(document.querySelectorAll('a, button'))
-                .filter(el => /add\s*from\s*computer/i.test((el.textContent || '').trim())
-                           && el.getBoundingClientRect().width > 0);
-              if (!cands.length) throw new Error('no Add from computer menu item');
-              cands[0].click();
-            }"""
-        )
-    fc = fc_info.value
-    fc.set_files([str(p) for p in file_paths])
-    page.wait_for_timeout(1500)
-
-
-def attach_from_resman(
-    page: Page,
-    filenames: list,
-    fallback_local_paths: list | None = None,
-) -> list:
-    """Attach each requested filename to the current Send Email dialog by
-    opening the 'Add from ResMan' picker. Since we now API-upload docs into
-    a `/Move-Out Docs` subfolder, we always try to expand that folder first
-    so the file checkboxes are reachable.
-
-    If the picker still doesn't have our file(s) after retries AND
-    `fallback_local_paths` is provided, we close the picker and use 'Add
-    from Computer' to attach the local files directly. Only raises if both
-    strategies fail — the caller gets a status:error only when nothing
-    could be attached.
-    """
-    log(f"Attaching from ResMan: {filenames}")
-
-    last_result: list = []
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        _open_attachment_picker(page)
-        # Expand our /Move-Out Docs folder so file rows + checkboxes become
-        # reachable. The folder-name text is the folder segment without the
-        # leading '/'. Best-effort — a False here means the folder wasn't
-        # (yet) rendered; we still let the picker settle and try the file
-        # lookup, which will just report missing and we'll retry / fallback.
-        folder_display = RESMAN_DOCS_FOLDER.lstrip("/")
-        if _expand_folder_in_picker(page, folder_display):
-            page.wait_for_timeout(500)
-
-        # Wait up to 6s (first try) or 12s (subsequent) for the file names
-        # to actually be rendered anywhere in the picker DOM.
-        wait_ms = 6000 if attempt == 1 else 12000
-        try:
-            _wait_picker_has_files(page, filenames, timeout_ms=wait_ms)
-        except PWTimeout:
-            log(f"Picker attempt {attempt}: file(s) not indexed yet.")
-            last_result = [{"name": n, "checked": False, "missing": True} for n in filenames]
-            _cancel_attachment_picker(page)
-            if attempt < max_attempts:
-                page.wait_for_timeout(3000)
-                continue
-            # Exhausted picker attempts — try the local-file fallback if given.
-            if fallback_local_paths:
-                log("Picker never surfaced file(s); falling back to Add-from-Computer.")
-                _attach_from_computer(page, fallback_local_paths)
-                return [{"name": p.name, "checked": True, "source": "computer"} for p in fallback_local_paths]
-            raise RuntimeError(
-                f"Attachment(s) not found in ResMan picker after {max_attempts} attempts: {filenames}"
-            )
-
-        # Retry the checkbox check WITHOUT closing the picker. The row can
-        # be in the DOM (wait_picker_has_files succeeded) but the checkbox
-        # not yet clickable (getBoundingClientRect().width==0) — layout
-        # settles a beat later. Closing + reopening the picker was pure
-        # overhead (Gabriel Tosella 2026-08-04, three round-trips wasted).
-        for check_attempt in range(1, 6):
-            last_result = _check_files_in_picker(page, filenames)
-            log(f"Attachment check result: {last_result}")
-            missing_now = [r["name"] for r in last_result if r.get("missing") or not r.get("checked")]
-            if not missing_now:
-                break
-            log(f"Picker check retry {check_attempt}: still missing/unchecked = {missing_now}; waiting 2s in-picker.")
-            page.wait_for_timeout(2000)
-
-        missing = [r["name"] for r in last_result if r.get("missing") or not r.get("checked")]
-        if not missing:
-            break
-
-        log(f"Picker attempt {attempt}: still missing/unchecked = {missing}. Retrying (reopen picker).")
-        _cancel_attachment_picker(page)
-        if attempt >= max_attempts:
-            if fallback_local_paths:
-                log("Picker checkbox still not selectable; falling back to Add-from-Computer.")
-                _attach_from_computer(page, fallback_local_paths)
-                return [{"name": p.name, "checked": True, "source": "computer"} for p in fallback_local_paths]
-            raise RuntimeError(
-                f"Attachment(s) still not selectable after {max_attempts} attempts: {missing}"
-            )
-        page.wait_for_timeout(3000)
-
-    # Click OK on the picker to commit the selection. Trust the retry loop's
-    # confirmed `checked: True` — ResMan's jQuery model has the attachment
-    # committed at that point.
+    # 5: make sure Show-in-resident-portal stays UNCHECKED (defensive — the
+    # ResMan API upload for these docs uses showInResidentPortal=false; the
+    # UI modal should default the same, but assert to be safe).
     page.evaluate(
         r"""() => {
-          const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'OK' && b.getBoundingClientRect().width>0);
-          btns[0]?.click();
+          const dialogs = Array.from(document.querySelectorAll('.ui-dialog'));
+          const modal = dialogs.find(d => (d.querySelector('.ui-dialog-title')?.textContent || '').trim() === 'Add From Computer');
+          if (!modal) return;
+          const cbs = Array.from(modal.querySelectorAll('input[type="checkbox"]'));
+          for (const cb of cbs) {
+            const label = cb.closest('label')?.textContent
+                       || cb.parentElement?.textContent
+                       || '';
+            if (/resident\s*portal/i.test(label) && cb.checked) {
+              cb.click();  // uncheck
+            }
+          }
         }"""
     )
-    page.wait_for_timeout(600)
-    return last_result
 
-    return last_result
+    # Wait for upload to finalize (ResMan pre-uploads the file to a staging
+    # area before Ok commits it). Give it up to 15s; the file input's parent
+    # row usually shows a size / status when done.
+    page.wait_for_timeout(2000)
+
+    # 6: click Ok in the modal.
+    ok_result = page.evaluate(
+        r"""() => {
+          const dialogs = Array.from(document.querySelectorAll('.ui-dialog'));
+          const modal = dialogs.find(d => (d.querySelector('.ui-dialog-title')?.textContent || '').trim() === 'Add From Computer');
+          if (!modal) return { ok: false, reason: 'modal not found' };
+          const btns = Array.from(modal.querySelectorAll('button, a.ui-button'))
+            .filter(b => /^ok$/i.test((b.textContent || '').trim())
+                      && b.getBoundingClientRect().width > 0);
+          if (!btns.length) return { ok: false, reason: 'no Ok button visible' };
+          btns[0].click();
+          return { ok: true };
+        }"""
+    )
+    if not ok_result.get("ok"):
+        raise RuntimeError(f"Add-from-Computer Ok click failed: {ok_result}")
+
+    # 7: wait for the nested modal to close. The outer Send Email dialog
+    # (#FromObject) must remain open.
+    page.wait_for_function(
+        r"""() => {
+          const dialogs = Array.from(document.querySelectorAll('.ui-dialog'));
+          return !dialogs.some(d =>
+            (d.querySelector('.ui-dialog-title')?.textContent || '').trim() === 'Add From Computer'
+            && d.getBoundingClientRect().width > 0
+          );
+        }""",
+        timeout=30000,
+    )
+    page.wait_for_timeout(500)
+    return [{"name": p.name, "checked": True, "source": "computer"} for p in file_paths]
 
 
 def click_send(page: Page):
@@ -2227,30 +2101,23 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
 
         # ------- Step 5: Resident email — attach merged PDF, send -------
         if email_enabled:
-            # ResMan's attachment picker indexes API-uploaded docs on its own
-            # schedule; observed anywhere from 2s to 3+ minutes. Give it a
-            # generous settle before we even open the email dialog — the
-            # dialog cost (5-10s to open) is dwarfed by the cost of failing
-            # attach + running send_email_only.py after (Gabriel Tosella
-            # 2026-08-04). 15s catches the fast case; the picker's own
-            # retry loop handles slower cases.
-            page.wait_for_timeout(15000)
             open_send_email_dialog(page)
             set_from(page, from_pref)
             apply_template(page, template)
             set_from(page, from_pref)  # template resets From; re-set.
+            # Attach the merged PDF (or claim form + FAS as separate files)
+            # via the 'Add from computer' modal. The old 'Add from ResMan'
+            # picker was consistently flaky — checkbox couldn't be selected
+            # even after ResMan API had indexed the doc (Randall Huberty
+            # 2026-08-04). The merged PDF is already on disk anyway, and
+            # ResMan Documents still holds it via the API upload step above.
             if combined:
-                attachment_names = [combined.name]
-                fallback_paths = [combined]
+                local_paths = [combined]
             else:
-                attachment_names = [claim_form_path.name]
-                fallback_paths = [claim_form_path]
+                local_paths = [claim_form_path]
                 if fas_path:
-                    attachment_names.append(fas_path.name)
-                    fallback_paths.append(fas_path)
-            result["email"]["attachedByResMan"] = attach_from_resman(
-                page, attachment_names, fallback_local_paths=fallback_paths,
-            )
+                    local_paths.append(fas_path)
+            result["email"]["attachedByResMan"] = attach_via_computer(page, local_paths)
             # Attaching often re-triggers the From default; re-set.
             set_from(page, from_pref)
             result["email"]["to"] = result["resident"]["email"]
