@@ -134,6 +134,10 @@ DOCUPOST_DEFAULTS = {
     "doublesided":  False,
 }
 CERT_FILENAME        = "MO Docs - Mail Certification.png"
+
+# --- ResMan Partner API (used to upload docs into resident's Documents tab) ---
+RESMAN_API_URL       = "https://partners-api.myresman.com"
+RESMAN_DOCS_FOLDER   = "/Move-Out Docs"
 DEFAULT_SENDER = {
     "name":     "49th St Apartments",
     "address1": "8400 49th Street N",
@@ -308,8 +312,16 @@ def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | N
     info = page.evaluate(
         r"""() => {
           const a = document.querySelector('#MoveOutReconciliationLink');
+          const href = a.getAttribute('data-href') || '';
           window.jQuery(a).trigger('click');
-          return { dataHref: a.getAttribute('data-href') };
+          // Also extract 'oid' (BillingAccountId) from the data-href query
+          // string — ResMan Partner API's POST /Documents needs it as `Id`
+          // when type=Lease.
+          const oidMatch = href.match(/[?&]oid=([0-9a-fA-F-]{36})/);
+          return {
+            dataHref: href,
+            oid: oidMatch ? oidMatch[1] : null,
+          };
         }"""
     )
     info['propertySignals'] = signals
@@ -386,7 +398,15 @@ def add_charge(page: Page, description: str, amount: float, category: str = DEFA
 
 
 def capture_mor_totals(page: Page) -> dict:
-    """Read totals + deposit info from the MOR page before clicking Approve."""
+    """Read totals + deposit info from the MOR page before clicking Approve.
+
+    `depositsAvailableTotal` = the TOTAL deposits-on-hand for the resident
+    (sum of every deposit line — some residents have multiple). Read from
+    the Totals row of the deposits table (the one whose header is
+    "Available Deposit"). This is what the Claim Form's "Amount of
+    Security Deposit" line should reflect — NOT `availableDepositApplied`,
+    which is only the portion of the deposit applied to offset charges.
+    """
     return page.evaluate(
         r"""() => {
           const grab = (id) => document.getElementById(id)?.value || null;
@@ -397,10 +417,29 @@ def capture_mor_totals(page: Page) -> dict:
             const vals = Array.from(cell.parentElement.querySelectorAll('td')).map(td => td.textContent.trim()).filter(Boolean);
             return vals[vals.length - 1];
           };
+          const depositsAvailableTotal = (() => {
+            const th = Array.from(document.querySelectorAll('th')).find(t => t.textContent.trim() === 'Available Deposit');
+            if (!th) return null;
+            const table = th.closest('table');
+            if (!table) return null;
+            const totalsRow = Array.from(table.querySelectorAll('tr')).find(tr => {
+              const first = tr.querySelector('td, th');
+              return first && first.textContent.trim() === 'Totals';
+            });
+            if (!totalsRow) return null;
+            const tds = Array.from(totalsRow.querySelectorAll('td, th'));
+            // Column index of "Available Deposit" in the header row.
+            const headerRow = th.parentElement;
+            const headers = Array.from(headerRow.querySelectorAll('th, td'));
+            const col = headers.indexOf(th);
+            if (col < 0 || col >= tds.length) return null;
+            return tds[col].textContent.trim();
+          })();
           return {
             currentOpenBalanceTotal:         total('Current Open Balance Total'),
             finalMoveOutChargesCreditsTotal: total('Final Move Out Charges / Credits Total'),
             balanceBeforeDepositsTotal:      total('Balance before Deposits Total'),
+            depositsAvailableTotal:          depositsAvailableTotal,
             availableDepositApplied:         document.querySelector('input[name*="ApplyToBalanceAmount"]')?.value || null,
             paymentCreditRefund:             grab('PaymentRefundAmount'),
             depositRefund:                   grab('CalculatedDepositRefundAmount'),
@@ -628,15 +667,29 @@ def generate_claim_form(
     dst = out_dir / f"Claim Form - {safe_slug(resident_name)}.docx"
     shutil.copy2(CLAIM_TEMPLATE, dst)
 
-    sec_deposit = parse_money(totals.get("availableDepositApplied") or "0")
-    credit_over = 0.00
+    # Field derivation (see docstring for the claim-form field map):
+    #   sec_deposit       = deposits on hand (sum of every deposit line)
+    #   credit_over       = credit-from-overpayment (only when past balance is negative)
+    #   sec_plus_cred     = deposit + credit (money we're holding for the resident)
+    #   dep_applied       = amount actually pulled from deposit to zero the balance
+    #   total_charges     = move-out charges + prior owed balance (positive part only)
+    #   landlord→resident = refund back to resident (deposit refund + payment refund)
+    #   resident→landlord = balance still owed after applying deposit
+    sec_deposit = parse_money(
+        totals.get("depositsAvailableTotal")
+        or totals.get("availableDepositApplied")
+        or "0"
+    )
+    open_bal   = parse_money(totals.get("currentOpenBalanceTotal") or "0")
+    mo_charges = parse_money(totals.get("finalMoveOutChargesCreditsTotal") or "0")
+    dep_applied = parse_money(totals.get("availableDepositApplied") or "0")
+    credit_over = abs(open_bal) if open_bal < 0 else 0.0
     sec_plus_cred = sec_deposit + credit_over
-    total_charges = parse_money(totals.get("balanceBeforeDepositsTotal"))
-    resident_to_landlord = parse_money(totals.get("balanceOwed"))
-    landlord_to_resident = 0.0
-    # If deposit refunded to resident, adjust:
+    total_charges = mo_charges + max(0.0, open_bal)
+    resident_to_landlord = parse_money(totals.get("balanceOwed") or "0")
     dep_refund = parse_money(totals.get("depositRefund") or "0")
     pay_refund = parse_money(totals.get("paymentCreditRefund") or "0")
+    landlord_to_resident = 0.0
     if dep_refund + pay_refund > 0 and resident_to_landlord == 0:
         landlord_to_resident = dep_refund + pay_refund
 
@@ -670,7 +723,7 @@ def generate_claim_form(
     force(paras[8],  f"Resident(s) Name:    {resident_name}")
     force(paras[9],  f"Address: {street}")
     force(paras[10], citystatezip)
-    force(paras[12], f"This is a notice of my intention to impose a claim for damages in the amount of: $ {money(sec_deposit)}")
+    force(paras[12], f"This is a notice of my intention to impose a claim for damages in the amount of: $ {money(dep_applied)}")
     force(paras[18], f"Amount of Security Deposit:\t \t\t$ {money(sec_deposit)}")
     force(paras[19], f"Credit from Overpayment:\t\t \t$ {money(credit_over)}")
     force(paras[20], f"Total Security Deposit and Credit:\t \t$ {money(sec_plus_cred)}")
@@ -889,6 +942,23 @@ def _wait_picker_has_files(page: Page, filenames: list, timeout_ms: int):
     )
 
 
+def _expand_folder_in_picker(page: Page, folder_display_name: str) -> bool:
+    """Click a `.folder-name` in the ResMan attachments picker to expand it,
+    revealing the file rows + their checkboxes. Idempotent. Returns True if
+    a folder with the given display name was found and clicked."""
+    return page.evaluate(
+        r"""(want) => {
+          const el = Array.from(document.querySelectorAll('.folder-name'))
+            .find(x => x.textContent.trim() === want);
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center' });
+          el.click();
+          return true;
+        }""",
+        folder_display_name,
+    )
+
+
 def _check_files_in_picker(page: Page, filenames: list) -> list:
     """Tick the checkbox next to each filename in the visible picker.
     Returns [{name, checked, missing?}, ...]."""
@@ -916,13 +986,51 @@ def _check_files_in_picker(page: Page, filenames: list) -> list:
     )
 
 
-def attach_from_resman(page: Page, filenames: list) -> list:
+def _attach_from_computer(page: Page, file_paths: list) -> None:
+    """Fallback attach path when the ResMan picker doesn't surface our file:
+    click 'Add' → 'Add from computer', pick the local file(s) via the file
+    chooser. Used only when API-uploaded files aren't discoverable in the
+    picker after folder expand + retries. Raises if the dropdown menu item
+    can't be found — caller decides how to react."""
+    log(f"Attaching via 'Add from Computer' (fallback): {[p.name for p in file_paths]}")
+    with page.expect_file_chooser() as fc_info:
+        page.evaluate(
+            r"""() => {
+              document.getElementById('Add')?.click();
+            }"""
+        )
+        page.wait_for_timeout(400)
+        # 'Add from computer' menu item — the dropdown renders it as a
+        # visible link/button next to 'btnAddFromCloud'.
+        page.evaluate(
+            r"""() => {
+              const cands = Array.from(document.querySelectorAll('a, button'))
+                .filter(el => /add\s*from\s*computer/i.test((el.textContent || '').trim())
+                           && el.getBoundingClientRect().width > 0);
+              if (!cands.length) throw new Error('no Add from computer menu item');
+              cands[0].click();
+            }"""
+        )
+    fc = fc_info.value
+    fc.set_files([str(p) for p in file_paths])
+    page.wait_for_timeout(1500)
+
+
+def attach_from_resman(
+    page: Page,
+    filenames: list,
+    fallback_local_paths: list | None = None,
+) -> list:
     """Attach each requested filename to the current Send Email dialog by
-    opening the 'Add from ResMan' picker. Retries up to 3 times with a
-    close/reopen if the picker's inventory doesn't include the file yet
-    (typical race right after upload_document). Raises RuntimeError when
-    still missing after retries so the outer runner records status:error
-    instead of sending an empty email.
+    opening the 'Add from ResMan' picker. Since we now API-upload docs into
+    a `/Move-Out Docs` subfolder, we always try to expand that folder first
+    so the file checkboxes are reachable.
+
+    If the picker still doesn't have our file(s) after retries AND
+    `fallback_local_paths` is provided, we close the picker and use 'Add
+    from Computer' to attach the local files directly. Only raises if both
+    strategies fail — the caller gets a status:error only when nothing
+    could be attached.
     """
     log(f"Attaching from ResMan: {filenames}")
 
@@ -930,9 +1038,17 @@ def attach_from_resman(page: Page, filenames: list) -> list:
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         _open_attachment_picker(page)
-        # First try: wait up to 6s for our specific files to appear in the picker.
-        # Subsequent tries: wait longer, since the picker inventory refresh is
-        # what we're actually waiting on.
+        # Expand our /Move-Out Docs folder so file rows + checkboxes become
+        # reachable. The folder-name text is the folder segment without the
+        # leading '/'. Best-effort — a False here means the folder wasn't
+        # (yet) rendered; we still let the picker settle and try the file
+        # lookup, which will just report missing and we'll retry / fallback.
+        folder_display = RESMAN_DOCS_FOLDER.lstrip("/")
+        if _expand_folder_in_picker(page, folder_display):
+            page.wait_for_timeout(500)
+
+        # Wait up to 6s (first try) or 12s (subsequent) for the file names
+        # to actually be rendered anywhere in the picker DOM.
         wait_ms = 6000 if attempt == 1 else 12000
         try:
             _wait_picker_has_files(page, filenames, timeout_ms=wait_ms)
@@ -943,6 +1059,11 @@ def attach_from_resman(page: Page, filenames: list) -> list:
             if attempt < max_attempts:
                 page.wait_for_timeout(3000)
                 continue
+            # Exhausted picker attempts — try the local-file fallback if given.
+            if fallback_local_paths:
+                log("Picker never surfaced file(s); falling back to Add-from-Computer.")
+                _attach_from_computer(page, fallback_local_paths)
+                return [{"name": p.name, "checked": True, "source": "computer"} for p in fallback_local_paths]
             raise RuntimeError(
                 f"Attachment(s) not found in ResMan picker after {max_attempts} attempts: {filenames}"
             )
@@ -957,6 +1078,10 @@ def attach_from_resman(page: Page, filenames: list) -> list:
         log(f"Picker attempt {attempt}: still missing/unchecked = {missing}. Retrying.")
         _cancel_attachment_picker(page)
         if attempt >= max_attempts:
+            if fallback_local_paths:
+                log("Picker checkbox still not selectable; falling back to Add-from-Computer.")
+                _attach_from_computer(page, fallback_local_paths)
+                return [{"name": p.name, "checked": True, "source": "computer"} for p in fallback_local_paths]
             raise RuntimeError(
                 f"Attachment(s) still not selectable after {max_attempts} attempts: {missing}"
             )
@@ -964,18 +1089,15 @@ def attach_from_resman(page: Page, filenames: list) -> list:
 
     # Click OK on the picker to commit the selection. Trust the retry loop's
     # confirmed `checked: True` — ResMan's jQuery model has the attachment
-    # committed at that point. Previous belt-and-suspenders "verify parent
-    # Attachments row" wait scoped to the wrong DOM element and killed
-    # otherwise-successful runs (see run 29281144997).
+    # committed at that point.
     page.evaluate(
         r"""() => {
           const btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'OK' && b.getBoundingClientRect().width>0);
           btns[0]?.click();
         }"""
     )
-    # Small settle so the picker fully closes before the caller re-touches
-    # the email dialog (re-setting From, clicking Send).
     page.wait_for_timeout(600)
+    return last_result
 
     return last_result
 
@@ -1204,6 +1326,111 @@ def _load_docupost_web_creds() -> tuple[str | None, str | None]:
     if not m:
         return user, pw
     return user or m.group(1).strip(), pw or m.group(2).strip()
+
+
+def _load_resman_api_creds() -> tuple[str | None, str | None, str | None]:
+    """Resolve ResMan Partner API credentials. Env wins over Cardentials.txt.
+    Returns (partner_id, api_key, account_id) — any may be None if unresolved."""
+    pid = os.environ.get("RESMAN_PARTNER_ID")
+    key = os.environ.get("RESMAN_API_KEY")
+    acc = os.environ.get("RESMAN_ACCOUNT_ID")
+    if pid and key and acc:
+        return pid, key, acc
+    cred_file = HERE / "Cardentials.txt"
+    if not cred_file.exists():
+        return pid, key, acc
+    try:
+        text = cred_file.read_text(encoding="utf-8")
+    except Exception:
+        return pid, key, acc
+    section = re.search(r"ResMan API:.*?(?=\n\S|\Z)", text, re.S | re.I)
+    if not section:
+        return pid, key, acc
+    body = section.group(0)
+    m_pid = re.search(r"Partner ID:\s*(\S+)", body, re.I)
+    m_key = re.search(r"API Key:\s*(\S+)",    body, re.I)
+    m_acc = re.search(r"Account ID:\s*(\S+)", body, re.I)
+    return (
+        pid or (m_pid.group(1).strip() if m_pid else None),
+        key or (m_key.group(1).strip() if m_key else None),
+        acc or (m_acc.group(1).strip() if m_acc else None),
+    )
+
+
+def upload_document_via_api(
+    file_path: Path,
+    object_id: str,
+    property_id: str,
+    folder: str = RESMAN_DOCS_FOLDER,
+    show_in_resident_portal: bool = False,
+) -> dict:
+    """Upload a file to a resident's Documents via ResMan Partner API.
+
+    POST https://partners-api.myresman.com/Documents  (multipart/form-data)
+    Body fields:
+      propertyId (property GUID), Id (BillingAccountId/oid), type=Lease,
+      fileName, file, path (folder like '/Move-Out Docs').
+
+    Retries on Cloudflare 5xx (502/503/504) up to 3 times with backoff, since
+    the origin occasionally returns a transient 502 with a `retry_after: 60`
+    hint (observed 2026-08-04 during initial API smoke test).
+
+    Raises RuntimeError on unrecoverable non-2xx; returns the response JSON
+    (including `documentId`) on success.
+    """
+    try:
+        import requests  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(f"requests library missing (needed for ResMan API): {e}")
+
+    partner_id, api_key, account_id = _load_resman_api_creds()
+    if not (partner_id and api_key and account_id):
+        raise RuntimeError("ResMan API creds missing (env RESMAN_PARTNER_ID/API_KEY/ACCOUNT_ID or Cardentials.txt).")
+
+    url = f"{RESMAN_API_URL}/Documents"
+    headers = {"ResMan-Account-Id": account_id, "Accept": "application/json"}
+    data = {
+        "propertyId":           property_id,
+        "Id":                   object_id,
+        "type":                 "Lease",
+        "fileName":             file_path.name,
+        "path":                 folder,
+        "showInResidentPortal": "true" if show_in_resident_portal else "false",
+    }
+
+    RETRIABLE = {502, 503, 504}
+    last_err = None
+    for attempt in range(1, 4):
+        with open(file_path, "rb") as fh:
+            files = {"file": (file_path.name, fh.read(), "application/octet-stream")}
+        try:
+            r = requests.post(
+                url, auth=(partner_id, api_key),
+                headers=headers, data=data, files=files, timeout=120,
+            )
+        except requests.RequestException as e:
+            last_err = f"network error: {e}"
+            log(f"ResMan upload attempt {attempt} transport error: {e}")
+            if attempt < 3:
+                time.sleep(30)
+                continue
+            raise RuntimeError(f"ResMan upload failed (transport): {last_err}")
+
+        if 200 <= r.status_code < 300:
+            try:
+                obj = r.json()
+            except Exception:
+                obj = {"raw": r.text[:400]}
+            log(f"ResMan upload OK: {file_path.name} → docID {obj.get('documentId')} (path={folder})")
+            return obj
+
+        if r.status_code in RETRIABLE and attempt < 3:
+            log(f"ResMan upload attempt {attempt} got HTTP {r.status_code}; retrying in 65s.")
+            time.sleep(65)
+            continue
+        raise RuntimeError(f"ResMan upload failed HTTP {r.status_code}: {r.text[:400]}")
+
+    raise RuntimeError(f"ResMan upload failed after retries: {last_err}")
 
 
 def capture_docupost_certification(
@@ -1449,9 +1676,21 @@ def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, u
 
     label = f"Unit {unit}" if unit else (safe_slug(resident_name) or "Unknown")
     combined = out_dir / f"Move Out Docs - {label}.pdf"
+
+    def _is_empty_images_page(page_) -> bool:
+        """ResMan's FAS PDF appends a page whose only content is the header
+        text 'Images for Charges' when no charge images were uploaded. Drop
+        those — but only when that's the *only* thing on the page (don't
+        strip a legit page that starts with that header + actual images)."""
+        txt = (page_.extract_text() or "").strip().lower()
+        return txt == "images for charges"
+
     w = PdfWriter()
     for src in [claim_pdf, fas_pdf]:
         for page_ in PdfReader(str(src)).pages:
+            if src is fas_pdf and _is_empty_images_page(page_):
+                log("Skipping empty 'Images for Charges' page in FAS PDF.")
+                continue
             w.add_page(page_)
     with open(combined, "wb") as f:
         w.write(f)
@@ -1597,61 +1836,24 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             if combined:
                 result["docs"]["combinedPdf"] = str(combined)
 
-        # Prefer the Combined PDF for upload; fall back to the docx if the
-        # merge step didn't run (Word missing, deps missing, etc.).
-        uploaded_doc = combined or claim_form_path
-        upload_document(page, uploaded_doc)
+        # ============================================================
+        # NEW FLOW ORDER (2026-08-04):
+        #   1. Docupost sendletter (needs merged PDF only, NOT gated on email)
+        #   2. Cert screenshot from Docupost dashboard
+        #   3. API-upload merged PDF to /Move-Out Docs   (HARD-FAIL)
+        #   4. API-upload cert PNG   to /Move-Out Docs   (soft-fail)
+        #   5. Resident email: open dialog, attach merged PDF from ResMan
+        #      picker (with folder-expand + Add-from-Computer fallback), send
+        #   6. Comm Log verify
+        # No more Playwright button.add-files uploads — the API handles both
+        # files, avoiding the accordion-visibility flakiness that broke runs
+        # 30291119947 and 30858602298.
+        # ============================================================
 
-        if email_enabled:
-            # ResMan's attachments picker fetches its inventory server-side
-            # when it opens — the just-uploaded file needs a moment to
-            # appear there. Without this settle, the picker often opens
-            # with our file still missing and the retry loop has to close/reopen.
-            page.wait_for_timeout(2500)
-            open_send_email_dialog(page)
-            set_from(page, from_pref)
-            apply_template(page, template)
-            set_from(page, from_pref)  # template resets From; re-set.
-            # Attach only the Combined PDF when available (contains both
-            # Claim Form + FAS); otherwise the two separate docs.
-            if combined:
-                attachment_names = [combined.name]
-            else:
-                attachment_names = [claim_form_path.name]
-                if fas_path:
-                    attachment_names.append(fas_path.name)
-            result["email"]["attachedByResMan"] = attach_from_resman(page, attachment_names)
-            # Attaching from ResMan often re-triggers the From default; re-set.
-            set_from(page, from_pref)
-            result["email"]["to"] = result["resident"]["email"]
-            result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"
-            click_send(page)
-            result["email"]["sent"] = True
-
-            # Verify via Communication Log — the runner's "Email sent" log is
-            # not sufficient (see the T135 run 7/14/2026 where Send silently
-            # no-op'd but this same code path returned OK). One retry with
-            # longer wait if the first attempt sees nothing — Kendo grid can
-            # be slow to hydrate on small viewports.
-            subject_hint = result["email"]["subject"] or prop_name
-            comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=10)
-            if not comm["verified"]:
-                log("Comm Log verify miss; retrying with longer wait.")
-                comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=15)
-            result["email"]["commLogVerified"] = comm["verified"]
-            result["email"]["commLogRow"] = comm["row"]
-        else:
-            log("Email skipped (either --no-send or email.enabled=false).")
-
-        # ------- Docupost step (INSIDE the browser block) -------
-        # Moved inside so that after sendletter succeeds we can still upload
-        # the mail-certification screenshot back to the resident's Documents
-        # tab (needs the ResMan `page` context alive). Runs unless the caller
-        # explicitly opts out with docupost.enabled=false — an absent block
-        # still means "please try", matching how the Fillout form dispatches.
+        # ------- Step 1: Docupost sendletter -------
         dp_cfg = payload.get("docupost") or {}
         dp_enabled = dp_cfg.get("enabled") is not False
-        if dp_enabled and result["email"]["sent"] and combined:
+        if dp_enabled and combined:
             try:
                 result["docupost"] = _maybe_send_docupost(
                     cfg=dp_cfg,
@@ -1666,9 +1868,6 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             except Exception as e:
                 log(f"Docupost step failed: {type(e).__name__}: {e}")
                 result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
-        elif dp_enabled and not result["email"]["sent"]:
-            log("Docupost skipped: resident email was not sent.")
-            result["docupost"] = {"skipped": "resident_email_not_sent"}
         elif dp_enabled and not combined:
             log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
             result["docupost"] = {"skipped": "no_combined_pdf"}
@@ -1676,57 +1875,115 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             log("Docupost skipped: docupost.enabled=false in payload.")
             result["docupost"] = {"skipped": "disabled_in_payload"}
 
-        # ------- Mail certification screenshot -> ResMan Documents -------
-        # If sendletter succeeded, log into the Docupost dashboard, screenshot
-        # the delivery-status card (with USPS tracking #), and upload it back
-        # to the resident's Documents. Any failure is soft — the letter is
-        # already in flight and we never want cert capture to abort the run.
-        cert_uploaded, cert_tracking, cert_error = False, None, None
+        # ------- Step 2: Mail certification screenshot from Docupost dashboard -------
+        cert_path_actual: Path | None = None
+        cert_tracking: str | None = None
+        cert_capture_error: str | None = None
         letter_id = (result["docupost"] or {}).get("letterId")
         if letter_id:
             web_user, web_pass = _load_docupost_web_creds()
             if not (web_user and web_pass):
-                cert_error = "no_docupost_web_creds"
+                cert_capture_error = "no_docupost_web_creds"
                 log("Docupost cert skipped: DOCUPOST_WEB_USER/PASS not set (env or Cardentials.txt).")
             else:
                 try:
-                    cert_path, cert_tracking = capture_docupost_certification(
+                    cert_path_actual, cert_tracking = capture_docupost_certification(
                         browser=browser,
                         letter_id=letter_id,
                         out_dir=out_dir,
                         web_user=web_user,
                         web_pass=web_pass,
                     )
-                    if cert_path and cert_path.exists():
-                        try:
-                            # verify_via_comm_log opens the Communication Log
-                            # accordion, which hides the Documents section and
-                            # its button.add-files button. Navigate back to
-                            # the resident lease page so the upload button is
-                            # visible again before calling upload_document.
-                            page.goto(lease_url, wait_until="domcontentloaded")
-                            page.wait_for_selector(
-                                "button.add-files", state="visible", timeout=30000,
-                            )
-                            upload_document(page, cert_path)
-                            cert_uploaded = True
-                        except Exception as e:
-                            cert_error = f"upload_failed: {type(e).__name__}: {e}"
-                            log(f"Docupost cert upload to ResMan failed: {e}")
-                    else:
-                        cert_error = "screenshot_failed"
+                    if not (cert_path_actual and cert_path_actual.exists()):
+                        cert_capture_error = "screenshot_failed"
                 except Exception as e:
-                    cert_error = f"{type(e).__name__}: {e}"
+                    cert_capture_error = f"{type(e).__name__}: {e}"
                     log(f"Docupost cert capture crashed: {e}")
-            result["docupost"] = {
-                **(result["docupost"] or {}),
-                "certification": {
-                    "uploaded": cert_uploaded,
-                    "path":     str(out_dir / CERT_FILENAME) if cert_uploaded else None,
-                    "tracking": cert_tracking,
-                    "error":    cert_error,
-                },
-            }
+
+        # ------- Step 3: API-upload merged PDF (HARD-FAIL) -------
+        # This must succeed for the email step (attach picker looks for the
+        # file in ResMan Documents). Bubble any error up to the top-level
+        # exception handler which marks the run as error.
+        oid = mor_info.get("oid")
+        property_id = (
+            (prop_cfg or {}).get("proid")
+            or result["property"]["proid"]
+            or prop_signals.get("proid")
+        )
+        merged_doc_id: str | None = None
+        if combined:
+            if not oid or not property_id:
+                raise RuntimeError(
+                    f"Cannot API-upload merged PDF: missing oid={oid!r} or propertyId={property_id!r}"
+                )
+            resp = upload_document_via_api(combined, object_id=oid, property_id=property_id)
+            merged_doc_id = resp.get("documentId")
+            result["docs"]["combinedPdfDocumentId"] = merged_doc_id
+
+        # ------- Step 4: API-upload cert PNG (SOFT-FAIL) -------
+        cert_uploaded = False
+        cert_upload_error = cert_capture_error
+        cert_doc_id: str | None = None
+        if cert_path_actual and cert_path_actual.exists() and oid and property_id:
+            try:
+                resp = upload_document_via_api(
+                    cert_path_actual, object_id=oid, property_id=property_id,
+                )
+                cert_uploaded = True
+                cert_doc_id = resp.get("documentId")
+            except Exception as e:
+                cert_upload_error = f"upload_failed: {type(e).__name__}: {e}"
+                log(f"Cert PNG API upload failed (continuing): {e}")
+
+        result["docupost"] = {
+            **(result["docupost"] or {}),
+            "certification": {
+                "uploaded":   cert_uploaded,
+                "path":       str(cert_path_actual) if cert_uploaded and cert_path_actual else None,
+                "documentId": cert_doc_id,
+                "tracking":   cert_tracking,
+                "error":      cert_upload_error,
+            },
+        }
+
+        # ------- Step 5: Resident email — attach merged PDF, send -------
+        if email_enabled:
+            # ResMan indexes API-uploaded docs quickly, but give a small
+            # settle so the picker inventory is warm.
+            page.wait_for_timeout(2000)
+            open_send_email_dialog(page)
+            set_from(page, from_pref)
+            apply_template(page, template)
+            set_from(page, from_pref)  # template resets From; re-set.
+            if combined:
+                attachment_names = [combined.name]
+                fallback_paths = [combined]
+            else:
+                attachment_names = [claim_form_path.name]
+                fallback_paths = [claim_form_path]
+                if fas_path:
+                    attachment_names.append(fas_path.name)
+                    fallback_paths.append(fas_path)
+            result["email"]["attachedByResMan"] = attach_from_resman(
+                page, attachment_names, fallback_local_paths=fallback_paths,
+            )
+            # Attaching often re-triggers the From default; re-set.
+            set_from(page, from_pref)
+            result["email"]["to"] = result["resident"]["email"]
+            result["email"]["subject"] = f"{result['resident']['property']} - Move-Out Documents"
+            click_send(page)
+            result["email"]["sent"] = True
+
+            # ------- Step 6: Verify via Communication Log -------
+            subject_hint = result["email"]["subject"] or prop_name
+            comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=10)
+            if not comm["verified"]:
+                log("Comm Log verify miss; retrying with longer wait.")
+                comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=15)
+            result["email"]["commLogVerified"] = comm["verified"]
+            result["email"]["commLogRow"] = comm["row"]
+        else:
+            log("Email skipped (either --no-send or email.enabled=false).")
 
         context.close()
         browser.close()
