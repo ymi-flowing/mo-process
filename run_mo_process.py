@@ -339,10 +339,14 @@ def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | N
     )
     log("Resident detail loaded; capturing property signals + clicking Move Out Rec.")
 
+    # IMPORTANT: prefer #MoveOutReconciliationLink over #MoveOutReconciliationOpenLink.
+    # OpenLink appears first in DOM (comma-list selectors grab it) and its
+    # data-href only carries personID — no proid/oid. Link carries params in
+    # `href` (post-approval) OR `data-href` (pre-approval); read either.
     signals = page.evaluate(
         r"""(known) => {
           const out = { proid: null, nameMatches: [] };
-          const a = document.querySelector('#MoveOutReconciliationLink, #MoveOutReconciliationOpenLink');
+          const a = document.querySelector('#MoveOutReconciliationLink');
           if (a) {
             const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
             const m = href.match(/proid=([0-9a-fA-F-]{36})/);
@@ -360,11 +364,10 @@ def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | N
     info = page.evaluate(
         r"""() => {
           const a = document.querySelector('#MoveOutReconciliationLink');
-          const href = a.getAttribute('data-href') || '';
+          const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
           window.jQuery(a).trigger('click');
-          // Also extract 'oid' (BillingAccountId) from the data-href query
-          // string — ResMan Partner API's POST /Documents needs it as `Id`
-          // when type=Lease.
+          // Extract 'oid' (BillingAccountId) — ResMan Partner API's
+          // POST /Documents needs it as `Id` when type=Lease.
           const oidMatch = href.match(/[?&]oid=([0-9a-fA-F-]{36})/);
           return {
             dataHref: href,
@@ -1170,11 +1173,30 @@ def click_send(page: Page):
     if not state.get("ok"):
         raise RuntimeError(f"Send preconditions failed: {state}")
     # Wait for the Send Email dialog to close (FromObject gone from the DOM).
-    page.wait_for_function(
-        r"""() => !document.getElementById('FromObject')""",
-        timeout=45000,
-    )
-    log("Email dialog closed after Send.")
+    # Bumped from 45s to 90s — Mia's run (2026-08-04) had a genuine send that
+    # took slightly longer than 45s to close the dialog; the runner exited
+    # fatal and the caller had to re-send via send_email_only.py.
+    try:
+        page.wait_for_function(
+            r"""() => !document.getElementById('FromObject')""",
+            timeout=90000,
+        )
+        log("Email dialog closed after Send.")
+    except PWTimeout:
+        # Dialog still open after 90s. This can mean send is stuck OR the
+        # message actually left but ResMan is being unusually slow to close
+        # the modal. Rather than fatal, dismiss + let Comm Log verify be the
+        # authoritative signal (it always runs after this call).
+        log("Warning: Send dialog did not close within 90s. Continuing — Comm Log verify will confirm.")
+        try:
+            page.evaluate(
+                r"""() => {
+                  const dlg = document.getElementById('FromObject');
+                  if (dlg) dlg.style.display = 'none';
+                }"""
+            )
+        except Exception:
+            pass
 
 
 # ---------------------- Communication Log verification --------------------
@@ -1233,9 +1255,13 @@ def _b64_file(p: Path) -> str:
     return base64.b64encode(p.read_bytes()).decode("ascii")
 
 
-def push_pdf_to_repo(pdf_path: Path, repo: str, token: str, target_dir: str = DOCUPOST_EXAMPLES) -> str:
-    """Push a PDF to `<repo>/<target_dir>/<pdf_path.name>` via the GitHub
+def push_pdf_to_repo(pdf_path: Path, repo: str, token: str, target_dir: str = DOCUPOST_EXAMPLES, target_filename: str | None = None) -> str:
+    """Push a PDF to `<repo>/<target_dir>/<filename>` via the GitHub
     Contents API and return the public raw.githubusercontent.com URL.
+
+    `target_filename` overrides the on-disk name (used so the Docupost copy
+    can be `Unit <#> - <Resident>.pdf` while the local + ResMan-Documents
+    file keeps its own label). Defaults to `pdf_path.name`.
 
     Uses PUT with a base64-encoded body. Overwrites the file if it already
     exists (fetches its SHA first). The repo must be public for Docupost's
@@ -1248,7 +1274,7 @@ def push_pdf_to_repo(pdf_path: Path, repo: str, token: str, target_dir: str = DO
     except ImportError as e:
         raise RuntimeError(f"requests library missing (needed for GitHub push): {e}")
 
-    filename = pdf_path.name
+    filename = target_filename or pdf_path.name
     path     = f"{target_dir}/{filename}"
     api      = f"https://api.github.com/repos/{repo}/contents/{urllib_quote(path)}"
     headers  = {
@@ -1376,6 +1402,55 @@ def _load_docupost_web_creds() -> tuple[str | None, str | None]:
     return user or m.group(1).strip(), pw or m.group(2).strip()
 
 
+def _load_docupost_send_token() -> str | None:
+    """Resolve Docupost sendletter API token. Env wins over Cardentials.txt."""
+    tok = os.environ.get("DOCUPOST_TOKEN")
+    if tok:
+        return tok
+    cred_file = HERE / "Cardentials.txt"
+    if not cred_file.exists():
+        return None
+    try:
+        text = cred_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    section = re.search(r"Docupost API.*?(?=\n\s*\n|\Z)", text, re.S | re.I)
+    if not section:
+        return None
+    m = re.search(r"API Token:\s*(\S+)", section.group(0), re.I)
+    return m.group(1).strip() if m else None
+
+
+def _load_github_token() -> str | None:
+    """Resolve GitHub token for the Contents API push. Precedence:
+      1. GITHUB_TOKEN env var (CI auto-provides this).
+      2. 'GitHub Token: <pat>' line in Cardentials.txt.
+      3. `gh auth token` output (uses whatever the gh CLI is logged in with).
+
+    (3) means local dev "just works" as long as `gh auth login` was done —
+    no PAT needs to sit on disk."""
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        return tok
+    cred_file = HERE / "Cardentials.txt"
+    if cred_file.exists():
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+            m = re.search(r"GitHub\s*Token:\s*(\S+)", text, re.I)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+    try:
+        import subprocess
+        r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+    return None
+
+
 def _load_resman_api_creds() -> tuple[str | None, str | None, str | None]:
     """Resolve ResMan Partner API credentials. Env wins over Cardentials.txt.
     Returns (partner_id, api_key, account_id) — any may be None if unresolved."""
@@ -1391,7 +1466,10 @@ def _load_resman_api_creds() -> tuple[str | None, str | None, str | None]:
         text = cred_file.read_text(encoding="utf-8")
     except Exception:
         return pid, key, acc
-    section = re.search(r"ResMan API:.*?(?=\n\S|\Z)", text, re.S | re.I)
+    # Section terminates on a blank line or end-of-file. Earlier lookahead
+    # `(?=\n\S)` was wrong — every field line starts with a non-space char,
+    # so it stopped at the first field and body was always empty.
+    section = re.search(r"ResMan API:.*?(?=\n\s*\n|\Z)", text, re.S | re.I)
     if not section:
         return pid, key, acc
     body = section.group(0)
@@ -1499,47 +1577,63 @@ def capture_docupost_certification(
     context = browser.new_context(viewport={"width": 1400, "height": 1200})
     try:
         page = context.new_page()
-        page.goto(DOCUPOST_LETTER_URL.format(letter_id=letter_id), wait_until="domcontentloaded")
-        # Docupost either (a) 302s to /login, or (b) already-logged-in
-        # session lands us straight on the letter page. Detect which by
-        # racing the login-form Email field against the 'Delivery Status'
-        # text — whichever appears first wins.
+        # IMPORTANT: log in FIRST via /login, then navigate to the letter URL.
+        # Landing on /letter/<id> without an active session triggers Docupost's
+        # checkout/upsell modal — it hijacks the page and any URL-based checks
+        # give false positives. Login-first is the only reliable flow.
+        # (User-flagged 2026-08-04 after two failed smoke tests.)
+        log("Docupost: going to /login first (letter URL requires active session).")
+        page.goto(DOCUPOST_LOGIN_URL, wait_until="domcontentloaded")
         try:
             page.wait_for_function(
                 r"""() => {
-                  const hasLogin = !!Array.from(document.querySelectorAll('input'))
-                    .find(i => (i.placeholder || i.name || '').toLowerCase().includes('email'));
-                  const hasLetter = (document.body.innerText || '').includes('Delivery Status');
-                  return hasLogin || hasLetter;
+                  if (document.querySelector('input[type="email"]')) return true;
+                  // Persistent session may bounce us straight to /dashboard.
+                  if (location.pathname.startsWith('/dashboard')) return true;
+                  return false;
                 }""",
                 timeout=20000,
             )
         except PWError as e:
-            log(f"Docupost: neither login form nor letter page rendered: {e}")
-        # If it's the login page, fill and submit, then wait for the
-        # post-login redirect to complete BEFORE we start polling. Not
-        # waiting is what caused the "Execution context was destroyed"
-        # race in run 30277568782.
-        try:
-            email_box = page.get_by_role("textbox", name="Email")
-            if email_box.count() > 0 and email_box.first.is_visible():
-                email_box.first.fill(web_user, timeout=10000)
-                page.get_by_role("textbox", name="Password").fill(web_pass)
+            log(f"Docupost: /login neither showed form nor bounced to dashboard: {e}")
+
+        has_login_form = page.evaluate(
+            r"""() => !!document.querySelector('input[type="email"]')"""
+        )
+        if has_login_form:
+            log("Docupost: login form detected; signing in.")
+            try:
+                email_box    = page.locator('input[type="email"]').first
+                password_box = page.locator('input[type="password"]').first
+                email_box.wait_for(state="visible", timeout=15000)
+                email_box.fill(web_user, timeout=10000)
+                password_box.fill(web_pass, timeout=10000)
                 page.get_by_role("button", name="Log in").click()
-                # Wait for the letter page to actually render post-login.
-                # networkidle is best-effort; the Delivery Status text is the
-                # authoritative signal that we're on the right page and JS
-                # rendering has completed.
-                try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except PWError:
-                    pass
+                # After login, Docupost redirects to /dashboard. Wait for that.
                 page.wait_for_function(
-                    r"""() => (document.body.innerText || '').includes('Delivery Status')""",
-                    timeout=20000,
+                    r"""() => location.pathname.startsWith('/dashboard')""",
+                    timeout=30000,
                 )
+                log("Docupost: login succeeded (on /dashboard).")
+            except PWError as e:
+                log(f"Docupost login failed: {e}. URL now: {page.url}")
+        else:
+            log(f"Docupost: session already active ({page.url}); skipping login.")
+
+        # NOW go to the letter URL with an active session.
+        log(f"Docupost: navigating to letter {letter_id}")
+        page.goto(DOCUPOST_LETTER_URL.format(letter_id=letter_id), wait_until="domcontentloaded")
+        try:
+            page.wait_for_function(
+                r"""() => (document.body ? (document.body.innerText || '') : '').includes('Delivery Status')""",
+                timeout=25000,
+            )
         except PWError as e:
-            log(f"Docupost login step issue (continuing): {e}")
+            log(f"Docupost: letter page 'Delivery Status' text not visible: {e}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except PWError:
+            pass
         # Poll for the tracking #. Each iteration is wrapped so a transient
         # nav (Bubble.io does async rerenders) doesn't blow up the loop.
         tracking = None
@@ -1631,13 +1725,25 @@ def resident_name_from_page(page: Page) -> str:
 
 def unit_number_from_page(page: Page) -> str:
     """Return the resident's unit identifier preserving any letter prefix/suffix
-    (e.g. ``T135``, ``135``, ``135B``). Old form used ``/\\d+/`` which dropped
-    letters — T135 came out as 135 and cascaded into wrong filenames, ResMan
-    Documents naming, GitHub-hosted PDF path, and Docupost letter description."""
+    (e.g. ``T135``, ``135``, ``135B``). ResMan's resident header always has a
+    ``<td id="HeaderUnitNumber">Unit <#></td>`` — the stable selector. Old
+    approach scanned every ``<td>`` and matched the first starting with
+    "Unit ", but silently returned blank when we hit the page too early
+    (Mia Renfro 2026-08-04) or when the "Unit* 707D Renovated..." unit-type
+    row was the only match (asterisk broke the ^Unit\\s+ anchor)."""
+    try:
+        page.wait_for_selector('#HeaderUnitNumber', timeout=8000)
+    except PWTimeout:
+        pass  # fall through to the scan below
     return page.evaluate(
         r"""() => {
+          const header = document.querySelector('#HeaderUnitNumber');
+          if (header) {
+            const m = (header.textContent || '').match(/Unit\s+([A-Za-z]*\d+[A-Za-z]*)/);
+            if (m) return m[1];
+          }
           const cells = Array.from(document.querySelectorAll('td'));
-          const cell = cells.find(c => /^Unit\s+[A-Za-z]*\d+[A-Za-z]*\b/.test(c.textContent.trim()));
+          const cell  = cells.find(c => /^Unit\s+[A-Za-z]*\d+[A-Za-z]*\b/.test(c.textContent.trim()));
           return cell ? (cell.textContent.match(/^Unit\s+([A-Za-z]*\d+[A-Za-z]*)/) || ['',''])[1] : '';
         }"""
     )
@@ -1750,7 +1856,80 @@ def merge_claim_and_fas_to_pdf(claim_docx: Path, fas_pdf: Path, out_dir: Path, u
     return combined
 
 
-def run(payload: dict, send: bool, headless: bool) -> dict:
+def read_lease_scope_for_resume(page: Page, lease_url: str, known_property_names: list | None = None) -> dict:
+    """Resume-mode replacement for open_move_out_rec.
+
+    Loads the resident detail page, reads property signals + `oid` from the
+    Move Out Rec. anchor's data-href WITHOUT clicking (MOR is already
+    approved on a resumed run). Returns the same {'dataHref','oid',
+    'propertySignals'} shape open_move_out_rec does so downstream code can
+    consume it uniformly.
+    """
+    page.goto(lease_url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => !!document.querySelector('#MoveOutReconciliationLink')",
+        timeout=30000,
+    )
+    log("Resume: resident detail loaded; reading MOR link signals without clicking.")
+
+    # IMPORTANT: MUST prefer #MoveOutReconciliationLink over #MoveOutReconciliationOpenLink.
+    # OpenLink appears FIRST in DOM so a comma-list querySelector grabs it — and its
+    # href is `/Transactions/MoveOutReconciliationOpen?personID=<guid>` with no oid.
+    # #MoveOutReconciliationLink is the one whose href carries proid+oid+lid+perid.
+    # Post-approval, the params live in `href` (not `data-href`) since the "Move Out
+    # Rec (Complete)" state renders as a static link instead of an AJAX trigger.
+    js_scrape = r"""
+      () => {
+        const a = document.querySelector('#MoveOutReconciliationLink');
+        if (!a) return { href: '', found: false };
+        const raw = a.getAttribute('data-href') || a.getAttribute('href') || '';
+        return { href: raw, found: true };
+      }
+    """
+    scrape = page.evaluate(js_scrape)
+    href_str = (scrape or {}).get("href", "")
+
+    signals = page.evaluate(
+        r"""([href_str, known]) => {
+          const out = { proid: null, nameMatches: [] };
+          const m = href_str.match(/proid=([0-9a-fA-F-]{36})/);
+          if (m) out.proid = m[1];
+          const text = document.body.innerText || '';
+          for (const name of (known || [])) {
+            if (name && text.includes(name)) out.nameMatches.push(name);
+          }
+          return out;
+        }""",
+        [href_str, known_property_names or []],
+    )
+
+    import re as _re
+    oid_match = _re.search(r"[?&]oid=([0-9a-fA-F-]{36})", href_str)
+    info = {
+        "dataHref": href_str,
+        "oid":       oid_match.group(1) if oid_match else None,
+        "propertySignals": signals,
+    }
+    log(f"Resume: MOR link parsed — proid={signals.get('proid')} oid={info['oid']}")
+    return info
+
+
+def _find_existing_merged_pdf(out_dir: Path, unit: str, resident_name: str) -> Path | None:
+    """Locate the merged PDF for a resumed run. Tries the same candidate
+    filenames the runner would have written on the fresh run."""
+    candidates = []
+    if unit:
+        candidates.append(out_dir / f"Move Out Docs - Unit {unit}.pdf")
+    if resident_name:
+        candidates.append(out_dir / f"Move Out Docs - {resident_name}.pdf")
+        candidates.append(out_dir / f"Move Out Docs - {safe_slug(resident_name)}.pdf")
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict:
     lease_url = payload["leaseUrl"]
     charges   = payload["charges"]
     mor_date  = payload.get("morDate") or today_str()
@@ -1813,7 +1992,15 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         page = context.new_page()
 
         login(page)
-        mor_info = open_move_out_rec(page, lease_url, known_property_names=list(PROPERTIES.keys()))
+
+        if resume:
+            # Resume mode: MOR is already approved. Skip MOR click, charges,
+            # approve, claim-form generation, FAS download, and merge. Just
+            # rebuild the state we need (resident scope + on-disk merged PDF)
+            # and fall through to Docupost / cert / API upload / email.
+            mor_info = read_lease_scope_for_resume(page, lease_url, known_property_names=list(PROPERTIES.keys()))
+        else:
+            mor_info = open_move_out_rec(page, lease_url, known_property_names=list(PROPERTIES.keys()))
 
         # Resolve which property this resident belongs to (drives Claim Form
         # return address + email, Docupost sender, and result.resident.property).
@@ -1826,19 +2013,33 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             "config":   prop_cfg,
         }
 
-        fill_mor_date(page, mor_date)
-        for c in charges:
-            add_charge(page,
-                       description=c["description"],
-                       amount=float(c["amount"]),
-                       category=c.get("category", DEFAULT_CATEGORY))
-            page.wait_for_timeout(400)
+        claim_form_path = None
+        fas_path = None
+        combined = None
 
-        result["mor"]["totals"] = capture_mor_totals(page)
-        log(f"Totals: {result['mor']['totals']}")
+        if not resume:
+            fill_mor_date(page, mor_date)
+            for c in charges:
+                add_charge(page,
+                           description=c["description"],
+                           amount=float(c["amount"]),
+                           category=c.get("category", DEFAULT_CATEGORY))
+                page.wait_for_timeout(400)
 
-        approve_mor(page)
-        result["mor"]["status"] = "Complete"
+            result["mor"]["totals"] = capture_mor_totals(page)
+            log(f"Totals: {result['mor']['totals']}")
+
+            approve_mor(page)
+            result["mor"]["status"] = "Complete"
+        else:
+            result["mor"]["status"] = "Complete (resume)"
+            # Re-visit the detail page to pick up the resident info that
+            # normally lands after Approve navigates back here.
+            page.goto(lease_url, wait_until="domcontentloaded")
+            page.wait_for_function(
+                "() => !!document.querySelector('a[href^=\"mailto:\"]') || !!document.body.innerText.includes('Full name')",
+                timeout=20000,
+            )
 
         resident_name = resident_name_from_page(page)
         result["resident"]["name"]  = resident_name
@@ -1855,34 +2056,45 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
             result["mor"]["forwardingSource"] = "unit"
         result["mor"]["forwardingAddress"] = fwd
 
-        claim_form_path = generate_claim_form(
-            out_dir=out_dir,
-            resident_name=resident_name,
-            date_str=datetime.now().strftime("%m/%d/%Y"),
-            forwarding=fwd,
-            totals=result["mor"]["totals"],
-            charges=charges,
-            property_config=prop_cfg,
-        )
-        result["docs"]["claimForm"] = str(claim_form_path)
-
-        fas_path = download_fas_pdf(page, out_dir, resident_name, mor_date)
-        result["docs"]["fasPdf"] = str(fas_path) if fas_path else None
-
-        # Merge Claim Form + FAS into one PDF *before* uploading. We upload
-        # only the merged PDF to ResMan's Documents (the docx becomes an
-        # intermediate) so email attachments are a single, tidy file that
-        # matches what Docupost mails. Named `Move Out Docs - Unit <#>.pdf`
-        # so residents' files are indexed by unit, not by their name.
-        combined = None
-        if fas_path:
-            combined = merge_claim_and_fas_to_pdf(
-                claim_form_path, fas_path, out_dir,
-                unit=result["resident"]["unit"] or "",
+        if not resume:
+            claim_form_path = generate_claim_form(
+                out_dir=out_dir,
                 resident_name=resident_name,
+                date_str=datetime.now().strftime("%m/%d/%Y"),
+                forwarding=fwd,
+                totals=result["mor"]["totals"],
+                charges=charges,
+                property_config=prop_cfg,
+            )
+            result["docs"]["claimForm"] = str(claim_form_path)
+
+            fas_path = download_fas_pdf(page, out_dir, resident_name, mor_date)
+            result["docs"]["fasPdf"] = str(fas_path) if fas_path else None
+
+            # Merge Claim Form + FAS into one PDF *before* uploading. We upload
+            # only the merged PDF to ResMan's Documents (the docx becomes an
+            # intermediate) so email attachments are a single, tidy file that
+            # matches what Docupost mails. Named `Move Out Docs - Unit <#>.pdf`
+            # so residents' files are indexed by unit, not by their name.
+            if fas_path:
+                combined = merge_claim_and_fas_to_pdf(
+                    claim_form_path, fas_path, out_dir,
+                    unit=result["resident"]["unit"] or "",
+                    resident_name=resident_name,
+                )
+                if combined:
+                    result["docs"]["combinedPdf"] = str(combined)
+        else:
+            combined = _find_existing_merged_pdf(
+                out_dir, unit=result["resident"]["unit"] or "", resident_name=resident_name,
             )
             if combined:
                 result["docs"]["combinedPdf"] = str(combined)
+                log(f"Resume: using existing merged PDF: {combined}")
+            else:
+                raise RuntimeError(
+                    f"--resume: no merged PDF found in {out_dir} for unit={result['resident']['unit']!r} name={resident_name!r}"
+                )
 
         # ============================================================
         # NEW FLOW ORDER (2026-08-04):
@@ -1899,9 +2111,17 @@ def run(payload: dict, send: bool, headless: bool) -> dict:
         # ============================================================
 
         # ------- Step 1: Docupost sendletter -------
+        # Supports payload.docupost.letterId to REUSE an existing queued
+        # letter (skip the sendletter call, jump straight to cert capture).
+        # Needed when a prior run queued the letter but crashed before the
+        # cert/upload/email tail — we don't want to double-mail residents.
         dp_cfg = payload.get("docupost") or {}
         dp_enabled = dp_cfg.get("enabled") is not False
-        if dp_enabled and combined:
+        existing_letter_id = dp_cfg.get("letterId")
+        if existing_letter_id:
+            log(f"Docupost sendletter skipped: reusing existing letterId={existing_letter_id}")
+            result["docupost"] = {"letterId": existing_letter_id, "reused": True}
+        elif dp_enabled and combined:
             try:
                 result["docupost"] = _maybe_send_docupost(
                     cfg=dp_cfg,
@@ -2062,14 +2282,14 @@ def _maybe_send_docupost(
     """Push the Combined PDF to the public repo, then hand its raw URL to
     Docupost's sendletter API. Returns the docupost result block or a
     {'skipped': reason} dict."""
-    token_docupost = os.environ.get("DOCUPOST_TOKEN")
-    token_gh       = os.environ.get("GITHUB_TOKEN")
+    token_docupost = _load_docupost_send_token()
+    token_gh       = _load_github_token()
 
     if not token_docupost:
-        log("Docupost skipped: DOCUPOST_TOKEN env var missing.")
+        log("Docupost skipped: DOCUPOST_TOKEN missing (env or Cardentials.txt).")
         return {"skipped": "no_docupost_token"}
     if not token_gh:
-        log("Docupost skipped: GITHUB_TOKEN missing (only available in Actions).")
+        log("Docupost skipped: GITHUB_TOKEN missing (env or Cardentials.txt 'GitHub Token:').")
         return {"skipped": "no_github_token"}
 
     # Recipient must have street + city + state + zip.
@@ -2078,8 +2298,18 @@ def _maybe_send_docupost(
         log(f"Docupost skipped: forwarding address incomplete ({[k for k in required if not forwarding.get(k)]})")
         return {"skipped": "incomplete_address"}
 
-    # 1. Push the PDF and get its public raw URL.
-    raw_url = push_pdf_to_repo(combined_pdf, repo=repo, token=token_gh)
+    # 1. Push the PDF and get its public raw URL. The pushed filename is
+    # `Unit <#> - <Resident>.pdf` so the Docupost dashboard shows something
+    # readable (URL-encoded "Move Out Docs - Unit 1511.pdf" was rendering as
+    # "201511.pdf"). Local + ResMan-Documents copy keeps its own name.
+    dp_parts = []
+    if resident_unit:
+        dp_parts.append(f"Unit {resident_unit}")
+    if resident_name:
+        dp_parts.append(resident_name)
+    dp_filename = (" - ".join(dp_parts) + ".pdf") if dp_parts else combined_pdf.name
+
+    raw_url = push_pdf_to_repo(combined_pdf, repo=repo, token=token_gh, target_filename=dp_filename)
     if not _wait_raw_url_live(raw_url):
         return {"skipped": "raw_url_not_live", "pdfUrl": raw_url}
 
@@ -2114,7 +2344,7 @@ def _maybe_send_docupost(
     }
 
     cfg = dict(cfg)  # avoid mutating payload
-    cfg.setdefault("description", f"MO {resident_unit or ''} {resident_name or ''}".strip()[:40])
+    cfg.setdefault("description", (" - ".join(dp_parts))[:40] or "Move Out")
 
     return send_via_docupost(cfg, sender, recipient, raw_url, token_docupost)
 
@@ -2124,6 +2354,9 @@ def main():
     ap.add_argument("--payload", required=True, help="JSON, '@file', or '-' for stdin")
     ap.add_argument("--headless", action="store_true", help="Run headless (default: headed)")
     ap.add_argument("--no-send", action="store_true", help="Skip the final email Send click")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume after an approved MOR: skip MOR/charges/approve/claim-form/FAS/merge; "
+                         "use the merged PDF already on disk and pick up at Docupost.")
     args = ap.parse_args()
 
     started_iso = now_iso()
@@ -2132,7 +2365,7 @@ def main():
     payload = None
     try:
         payload = load_payload(args.payload)
-        result = run(payload, send=not args.no_send, headless=args.headless)
+        result = run(payload, send=not args.no_send, headless=args.headless, resume=args.resume)
         result["logs"] = list(_LOGS)
     except Exception as e:
         log(f"FATAL: {type(e).__name__}: {e}")
