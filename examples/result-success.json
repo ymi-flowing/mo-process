@@ -1,91 +1,118 @@
 {
   "status": "sent",
-  "startedAt": "2026-07-13T13:58:00Z",
-  "endedAt":   "2026-07-13T14:02:11Z",
-  "durationSeconds": 251,
+  "startedAt": "2026-08-03T22:25:41Z",
+  "endedAt":   "2026-08-03T22:31:47Z",
+  "durationSeconds": 366,
   "resident": {
-    "name": "Dwaun Spigner",
-    "unit": "317",
+    "name": "Beatriz Pestana Gonzalez",
+    "unit": "1511",
     "property": "49th St Apartments",
-    "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/a874cee1-95b8-4a95-bf71-60219c5925af",
-    "email": "dwaun803@gmail.com"
+    "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/e88267e1-ec9c-4190-8e37-f137e9bf4072",
+    "email": "beatrizpestana592@gmail.com"
   },
   "mor": {
-    "date": "7/13/2026",
+    "date": "8/3/2026",
     "status": "Complete",
     "charges": [
-      { "category": "Cleaning/Damage Charges", "description": "Cleaning",        "amount": 150.00 },
-      { "category": "Cleaning/Damage Charges", "description": "Carpet Cleaning", "amount": 200.00 }
+      { "category": "Cleaning/Damage Charges", "description": "Carpet Cleaning",       "amount": 200.00 },
+      { "category": "Cleaning/Damage Charges", "description": "Cleaning",              "amount": 175.00 },
+      { "category": "Cleaning/Damage Charges", "description": "Broken Smoke Detector", "amount": 45.00  }
     ],
     "totals": {
-      "currentOpenBalanceTotal": "3,257.90",
-      "finalMoveOutChargesCreditsTotal": "350.00",
-      "balanceBeforeDepositsTotal": "3,607.90",
-      "availableDepositApplied": "899.00",
-      "paymentCreditRefund": "0.00",
-      "depositRefund": "0.00",
-      "balanceOwed": "2,708.90"
+      "currentOpenBalanceTotal":         "0.00",
+      "finalMoveOutChargesCreditsTotal": "420.00",
+      "balanceBeforeDepositsTotal":      "420.00",
+      "depositsAvailableTotal":          "799.00",
+      "availableDepositApplied":         "420.00",
+      "paymentCreditRefund":             "0.00",
+      "depositRefund":                   "379.00",
+      "balanceOwed":                     "0.00"
     },
     "forwardingAddress": {
-      "street": "8400 49th Street North Apt. 317",
-      "unitNo": "317",
-      "city": "Pinellas Park",
-      "state": "FL",
-      "zip": "33781",
-      "county": null
+      "street":  "4137 43rd N St",
+      "unitNo":  null,
+      "city":    "St. Petersburg",
+      "state":   "FL",
+      "zip":     "33714",
+      "county":  null,
+      "country": null
     },
-    "forwardingSource": "unit"
+    "forwardingSource": "resident"
   },
   "docs": {
-    "claimForm":   "out/Claim Form - Dwaun Spigner.docx",
-    "fasPdf":      "out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf",
-    "combinedPdf": "out/Move Out Docs - Unit 317.pdf"
+    "claimForm":             "out/Claim Form - Beatriz Pestana Gonzalez.docx",
+    "fasPdf":                "out/Final Account Statement 8-3-2026 - Beatriz Pestana Gonzalez.pdf",
+    "combinedPdf":           "out/Move Out Docs - Unit 1511.pdf",
+    "combinedPdfDocumentId": "1750e571-9d76-4864-b4fe-26ee79296ee1"
   },
   "email": {
     "attempted": true,
     "sent": true,
-    "to": "dwaun803@gmail.com",
+    "to": "beatrizpestana592@gmail.com",
     "from": "property",
     "template": "***MO Docs Email",
     "subject": "49th St Apartments - Move-Out Documents",
     "attachedByResMan": [
-      { "name": "Move Out Docs - Unit 317.pdf", "checked": true }
-    ]
+      { "name": "Move Out Docs - Unit 1511.pdf", "checked": true }
+    ],
+    "commLogVerified": true,
+    "commLogRow": "8/3/2026 Beatriz Pestana Gonzalez 49th St Apartments - Move-Out Documents Email"
   },
   "docupost": {
-    "letterId": "1783965376009x528503078122137150",
-    "cost": 12.33,
-    "class": "usps_first_class",
+    "letterId":     "1785809124898x773025020956466400",
+    "cost":         12.03,
+    "class":        "usps_first_class",
     "servicelevel": "certified",
-    "pdfUrl": "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move%20Out%20Docs%20-%20Unit%20317.pdf"
+    "pdfUrl":       "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move%20Out%20Docs%20-%20Unit%201511.pdf",
+    "certification": {
+      "uploaded":   true,
+      "path":       "out/MO Docs - Mail Certification.png",
+      "documentId": "de5c1053-b94f-4af1-a73a-b2ce5dcdc956",
+      "tracking":   "92071902358909000043674521",
+      "error":      null
+    }
   },
   "github": {
-    "repo": "ymi-flowing/mo-process",
+    "repo":   "ymi-flowing/mo-process",
     "runUrl": "https://github.com/ymi-flowing/mo-process/actions/runs/1234567890"
   },
   "logs": [
-    "13:58:00 Login user: 'SNS_Assistant'",
-    "13:58:12 Resident detail loaded; clicking Move Out Rec.",
-    "13:58:15 Setting Move-out rec. date = 7/13/2026",
-    "13:58:16 Adding charge: Cleaning = $150.0 (Cleaning/Damage Charges)",
-    "13:58:20 Adding charge: Carpet Cleaning = $200.0 (Cleaning/Damage Charges)",
-    "13:58:26 Actions -> Approve",
-    "13:58:34 MOR approved.",
-    "13:58:36 Resident: 'Dwaun Spigner' unit '317'",
-    "13:58:38 Forwarding blank -> falling back to unit address.",
-    "13:58:47 Wrote claim form: out/Claim Form - Dwaun Spigner.docx",
-    "13:58:59 Downloading FAS PDF: Final Account Statement 7-13-26.pdf",
-    "13:59:01 Saved FAS PDF: out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf (75994 bytes)",
-    "13:59:03 Uploading claim form via Documents > Add.",
-    "13:59:14 Claim form uploaded.",
-    "13:59:20 Wrote combined PDF: out/Combined - Dwaun Spigner.pdf",
-    "13:59:25 Opening resident email dialog.",
-    "13:59:28 Setting From = property",
-    "13:59:30 Applying template: ***MO Docs Email",
-    "13:59:35 Setting From = property",
-    "13:59:37 Attaching from ResMan: ['Claim Form - Dwaun Spigner.docx', 'Final Account Statement 7-13-26.pdf']",
-    "14:02:05 Clicking Send.",
-    "14:02:11 Email sent."
+    "22:26:00 Login user: 'SNS_Assistant'",
+    "22:26:12 Resident detail loaded; capturing property signals + clicking Move Out Rec.",
+    "22:26:14 Property signals: proid=a262aa42-7393-4d84-9bf5-ae1bff852b32 nameMatches=['49th St Apartments']",
+    "22:26:14 Resolved property: '49th St Apartments'",
+    "22:26:15 Setting Move-out rec. date = 8/3/2026",
+    "22:26:16 Adding charge: Carpet Cleaning = $200.0 (Cleaning/Damage Charges)",
+    "22:26:18 Adding charge: Cleaning = $175.0 (Cleaning/Damage Charges)",
+    "22:26:20 Adding charge: Broken Smoke Detector = $45.0 (Cleaning/Damage Charges)",
+    "22:26:22 Totals: {'depositsAvailableTotal': '799.00', 'availableDepositApplied': '420.00', 'depositRefund': '379.00', 'balanceOwed': '0.00', ...}",
+    "22:26:23 Actions -> Approve",
+    "22:26:30 MOR approved.",
+    "22:26:34 Resident: 'Beatriz Pestana Gonzalez' unit '1511'",
+    "22:26:38 Wrote claim form: out/Claim Form - Beatriz Pestana Gonzalez.docx",
+    "22:26:52 Downloading FAS PDF: Final Account Statement 8-3-26.pdf",
+    "22:26:54 Saved FAS PDF: out/Final Account Statement 8-3-2026 - Beatriz Pestana Gonzalez.pdf (76412 bytes)",
+    "22:26:58 docx→PDF via LibreOffice",
+    "22:27:00 Skipping empty 'Images for Charges' page in FAS PDF.",
+    "22:27:00 Wrote merged PDF: out/Move Out Docs - Unit 1511.pdf",
+    "22:27:04 Pushed to repo: examples/Move Out Docs - Unit 1511.pdf",
+    "22:27:12 Docupost queued letter_id=1785809124898x773025020956466400 cost=$12.03",
+    "22:27:58 Docupost tracking #: 92071902358909000043674521",
+    "22:27:59 Saved Docupost certification: out/MO Docs - Mail Certification.png",
+    "22:28:02 ResMan upload OK: Move Out Docs - Unit 1511.pdf → docID 1750e571-9d76-4864-b4fe-26ee79296ee1 (path=/Move-Out Docs)",
+    "22:28:04 ResMan upload OK: MO Docs - Mail Certification.png → docID de5c1053-b94f-4af1-a73a-b2ce5dcdc956 (path=/Move-Out Docs)",
+    "22:28:12 Opening resident email dialog.",
+    "22:28:14 Setting From = property",
+    "22:28:16 Applying template: ***MO Docs Email",
+    "22:28:18 Setting From = property",
+    "22:28:20 Attaching from ResMan: ['Move Out Docs - Unit 1511.pdf']",
+    "22:28:26 Attachment check result: [{'name': 'Move Out Docs - Unit 1511.pdf', 'checked': True}]",
+    "22:28:28 Setting From = property",
+    "22:28:30 Verifying email dialog open before Send.",
+    "22:28:32 Send click state: {'ok': True, 'sendButtons': 1}",
+    "22:28:34 Email dialog closed after Send.",
+    "22:28:36 Verifying send via Communication Log (waiting 10s for Kendo grid to hydrate).",
+    "22:28:48 Comm Log verification: {'verified': True, 'row': '8/3/2026 Beatriz Pestana Gonzalez 49th St Apartments - Move-Out Documents Email', 'opened': True}"
   ],
   "error": null
 }

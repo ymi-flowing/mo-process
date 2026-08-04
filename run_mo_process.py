@@ -1,19 +1,42 @@
 """
 MO Process - SNS Multi Family Management LLC / ResMan
 
-Runs the full Move-Out / Final Account Statement workflow for a former resident:
+Runs the full Move-Out / Final Account Statement workflow for a former resident.
+
+FLOW (in order)
   1. Login to ResMan.
-  2. Open Move Out Reconciliation from the resident's Leasing Workflow.
+  2. Open Move Out Reconciliation from the resident's Leasing Workflow
+     (also captures `oid` = BillingAccountId from the MOR link's data-href —
+      needed later as the `Id` field for the ResMan Partner API upload).
   3. Fill Move-out rec. date (defaults to today).
-  4. Add each charge in the payload (default category: "Cleaning/Damage Charges").
-  5. Capture MOR totals (open balance, MO charges, balance owed, deposit, etc.).
+  4. Add each charge (default category: "Cleaning/Damage Charges").
+  5. Capture MOR totals — including `depositsAvailableTotal` (Totals row of
+     the Available Deposit table, which sums multi-deposit residents).
   6. Approve the reconciliation.
-  7. Read the resident's forwarding address; fall back to the unit's address if empty.
+  7. Read resident name / unit / email + forwarding address (via the Lease
+     Edit dialog for stable structured fields; falls back to Unit address
+     if forwarding is blank).
   8. Generate a filled Claim Form docx from Claim Form Example.Docx.
   9. Download the ResMan-generated Final Account Statement PDF.
- 10. Upload the Claim Form docx back to the resident's Documents tab.
- 11. Open the resident email, apply the ***MO Docs Email template, attach both docs
-     from ResMan, set From to the property, and (unless --no-send) click Send.
+ 10. Merge Claim Form + FAS → `Move Out Docs - Unit <#>.pdf`
+     (strips empty "Images for Charges" page from the FAS).
+ 11. Docupost sendletter — pushes merged PDF to public repo, POSTs to
+     https://app.docupost.com/api/1.1/wf/sendletter. Gated on the merged
+     PDF existing (NOT on the resident email). Returns letter_id + cost.
+ 12. Capture cert screenshot from Docupost dashboard (fresh browser
+     context; polls up to 180s for USPS tracking #; screenshots the
+     .bubble-element.Group containing Delivery Status + Recipient + Sender).
+     Saves as `out/MO Docs - Mail Certification.png`.
+ 13. ResMan API POST /Documents — upload merged PDF to /Move-Out Docs
+     (HARD-FAIL: email step needs the file in Documents to attach).
+ 14. ResMan API POST /Documents — upload cert PNG to /Move-Out Docs
+     (SOFT-FAIL: letter is already mailed).
+ 15. Open resident email, apply ***MO Docs Email template, attach the
+     merged PDF from ResMan's picker (expands /Move-Out Docs folder;
+     falls back to "Add from Computer" if the picker doesn't surface
+     the file after retries). Click Send.
+ 16. Verify via Communication Log (Kendo grid lazy-hydrates — waits 10s
+     then retries once at 15s).
 
 USAGE
     python run_mo_process.py --payload @payload.json
@@ -28,30 +51,35 @@ PAYLOAD (single object)
         { "description": "Cleaning",        "amount": 150.00 },
         { "description": "Carpet Cleaning", "amount": 200.00 }
       ],
-      "morDate": "7/13/2026",             // optional; defaults to today (M/D/YYYY)
+      "morDate": "8/3/2026",              // optional; defaults to today (M/D/YYYY)
       "email": {
         "enabled": true,                  // default true
         "from": "property",               // "property" or "assistant"; default property
         "template": "***MO Docs Email"    // default "***MO Docs Email"
       },
-      "docupost": {                       // optional; skipped if enabled=false or omitted
+      "docupost": {                       // optional; skipped if enabled=false
         "enabled": true,
         "class":        "usps_first_class",
         "servicelevel": "certified",
         "color":        false,
         "doublesided":  false,
-        "sender": {                       // optional; defaults to 49th St Apartments
+        "sender": {                       // optional; defaults to properties.json
           "name": "49th St Apartments", "address1": "8400 49th Street N",
           "city": "Pinellas Park", "state": "FL", "zip": "33781"
         }
       },
-      "outputDir": "out"                  // optional; defaults to CWD
+      "outputDir": "out"                  // optional; defaults to CWD/out
     }
 
-    Docupost step only runs when the resident email actually went AND we
-    produced a Combined PDF. Needs env DOCUPOST_TOKEN + GITHUB_TOKEN. The
-    runner pushes the Combined PDF to the public repo via the GitHub
-    Contents API to obtain a public URL Docupost can fetch.
+ENV VARIABLES
+    RESMAN_USER, RESMAN_PASS                   — ResMan web login (Playwright).
+    RESMAN_API_KEY, RESMAN_PARTNER_ID,         — ResMan Partner API (upload docs).
+      RESMAN_ACCOUNT_ID                          Basic auth + Account-Id header.
+    DOCUPOST_TOKEN                             — Docupost sendletter API.
+    DOCUPOST_WEB_USER, DOCUPOST_WEB_PASS       — Docupost dashboard (cert screenshot).
+    GITHUB_TOKEN                               — pushing merged PDF to repo/examples/.
+                                                 (auto-provided by GH Actions)
+    All creds also readable from Cardentials.txt (local dev fallback). Env wins.
 
 RESULT
     A single JSON object is ALWAYS printed to stdout at the end (both on success
@@ -59,39 +87,59 @@ RESULT
 
     {
       "status": "sent" | "sent_no_email" | "parked" | "error",
-      "startedAt": "2026-07-13T13:58:00Z",
-      "endedAt":   "2026-07-13T14:02:11Z",
-      "durationSeconds": 251,
+      "startedAt": "2026-08-03T22:25:41Z",
+      "endedAt":   "2026-08-03T22:31:47Z",
+      "durationSeconds": 366,
       "resident": {
-        "name": "Dwaun Spigner",
-        "unit": "317",
+        "name": "Beatriz Pestana Gonzalez", "unit": "1511",
         "property": "49th St Apartments",
         "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/...",
-        "email": "dwaun803@gmail.com"
+        "email": "..."
       },
       "mor": {
-        "date": "7/13/2026",
-        "status": "Complete",
-        "charges":  [ {"category":"Cleaning/Damage Charges","description":"...","amount":150} ],
-        "totals":   { "currentOpenBalanceTotal": "3,257.90", ... , "balanceOwed": "2,708.90" },
-        "forwardingAddress": { "street":"...", "city":"...", "state":"FL", "zip":"33781" },
+        "date": "8/3/2026", "status": "Complete",
+        "charges":  [ {"category":"...","description":"...","amount":200} ],
+        "totals":   {
+          "currentOpenBalanceTotal": "0.00",
+          "finalMoveOutChargesCreditsTotal": "420.00",
+          "balanceBeforeDepositsTotal": "420.00",
+          "depositsAvailableTotal": "799.00",
+          "availableDepositApplied": "420.00",
+          "paymentCreditRefund": "0.00",
+          "depositRefund": "379.00",
+          "balanceOwed": "0.00"
+        },
+        "forwardingAddress": { "street":"...", "city":"...", "state":"FL", "zip":"..." },
         "forwardingSource":  "resident" | "unit"
       },
       "docs": {
-        "claimForm":   "out/Claim Form - Dwaun Spigner.docx",
-        "fasPdf":      "out/Final Account Statement 7-13-26 - Dwaun Spigner.pdf",
-        "combinedPdf": "out/Combined - Dwaun Spigner.pdf"
+        "claimForm":              "out/Claim Form - <resident>.docx",
+        "fasPdf":                 "out/Final Account Statement 8-3-2026 - <resident>.pdf",
+        "combinedPdf":            "out/Move Out Docs - Unit <#>.pdf",
+        "combinedPdfDocumentId":  "<ResMan documentId>"    // from POST /Documents
       },
       "email": {
-        "attempted": true, "sent": true, "to": "dwaun803@gmail.com",
+        "attempted": true, "sent": true, "to": "...",
         "from": "property", "template": "***MO Docs Email",
-        "subject": "49th St Apartments - Move-Out Documents",
-        "attachedByResMan": [ {"name":"...","checked":true} ]
+        "subject": "... - Move-Out Documents",
+        "attachedByResMan": [ {"name":"...","checked":true} ],
+        "commLogVerified": true, "commLogRow": "..."
       },
-      "docupost": null,
-      "github": { "repo": "ymi-flowing/mo-process", "runUrl": null },
-      "logs": [ "13:58:00 Login user: 'SNS_Assistant'", ... ],
-      "error": null   // populated on failure with { "message": "...", "type": "..." }
+      "docupost": {
+        "letterId": "...", "cost": 12.33,
+        "class": "usps_first_class", "servicelevel": "certified",
+        "pdfUrl": "https://raw.githubusercontent.com/...",
+        "certification": {
+          "uploaded": true,
+          "path": "out/MO Docs - Mail Certification.png",
+          "documentId": "<ResMan documentId>",
+          "tracking": "92xxx...",
+          "error": null
+        }
+      },
+      "github": { "repo": "ymi-flowing/mo-process", "runUrl": "..." },
+      "logs":   [ "hh:mm:ss ...", ... ],
+      "error":  null   // populated on failure with { "type", "message", "traceback" }
     }
 """
 import argparse

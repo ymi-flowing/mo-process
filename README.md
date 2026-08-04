@@ -2,29 +2,143 @@
 
 Automates closing out a former resident's Final Account Statement in ResMan and generating the FL statutory Notice of Intention to Impose Claim on Security Deposit (Fla. Stat. § 83.49(3)).
 
-## Status
+**End-to-end**: MOR approve → Claim Form + FAS merge → certified mail via Docupost → cert screenshot → upload both docs to a `/Move-Out Docs` folder via ResMan API → resident email → Comm Log verify.
 
-End-to-end validated via Fillout → n8n → GitHub Actions on **Sheri Kovalik / unit 1905** (run [`29292682613`](https://github.com/ymi-flowing/mo-process/actions/runs/29292682613)):
+## Flow (in order)
 
-- MOR approved (4 charges, deposit applied, correct balance).
-- Merged PDF (`Move Out Docs - Unit 1905.pdf`) uploaded to ResMan's Documents accordion.
-- Resident email fired from the property mailbox with the merged PDF attached — visible in ResMan's Communication Log as an `Email` row.
-- Docupost certified letter queued: `letter_id 1783984849122x717523225467440900`, $12.63.
-- Summary email to your inbox rendered the SNS-branded HTML with all sections populated (resident, charges, totals, forwarding, email step, Docupost).
+```
+Login → open Move Out Rec → fill date + charges → capture totals → approve
+      → resident info (name/unit/email) + forwarding address (via Lease Edit dialog)
+      → generate Claim Form docx → download FAS PDF → merge (strip empty page)
+      → Docupost sendletter (push PDF to public repo, POST /sendletter)
+      → capture cert screenshot from Docupost dashboard
+      → ResMan API: POST /Documents  (merged PDF → /Move-Out Docs, HARD-fail)
+      → ResMan API: POST /Documents  (cert PNG   → /Move-Out Docs, SOFT-fail)
+      → open Send Email → apply template → attach merged PDF from picker → Send
+         (falls back to "Add from Computer" if picker doesn't surface the file)
+      → Comm Log verify (Kendo grid lazy-hydrate — waits up to 25s)
+```
 
-### Verifying an email actually sent
+**Typical run**: 4-5 min in CI. Biggest single wait is the Docupost tracking-number poll (up to 3 min; screenshot fires anyway on timeout).
 
-**Gotcha:** ResMan's Communication Log is a Kendo grid inside an accordion, and its rows lazy-hydrate AFTER the accordion opens. If you scan the DOM immediately after clicking the accordion, you'll see stale rows (or none) and think the email didn't go. To verify:
-1. Deep-link with `?open=Communication%20Log` on the resident detail URL, **or**
-2. Click the Comm Log accordion and wait 3–5 seconds before scanning.
+## Result JSON — what n8n gets back
 
-The sent email shows as `<date> | <resident> | <Property> - Move-Out Documents | Email`. It also appears (with more delay) as a PDF under `Documents → Email Communication`.
+Always these top-level keys, always a JSON object even on error/crash. `status ∈ {sent, sent_no_email, parked, error}`.
 
-**The runner now verifies this automatically.** After clicking Send, it opens the Communication Log accordion, waits for the Kendo grid to hydrate, and looks for the row. Result JSON gains `email.commLogVerified` (bool) and `email.commLogRow` (the matched row text). If verification fails, `status` is downgraded from `sent` → `sent_no_email` so the n8n summary email flags it.
+```json
+{
+  "status": "sent",
+  "startedAt": "2026-08-03T22:25:41Z",
+  "endedAt":   "2026-08-03T22:31:47Z",
+  "durationSeconds": 366,
+  "resident": {"name": "Beatriz Pestana Gonzalez", "unit": "1511", "property": "49th St Apartments", "email": "..."},
+  "mor": {
+    "date": "8/3/2026", "status": "Complete",
+    "charges": [{"category": "Cleaning/Damage Charges", "description": "Carpet Cleaning", "amount": 200.0}, ...],
+    "totals": {
+      "currentOpenBalanceTotal":         "0.00",
+      "finalMoveOutChargesCreditsTotal": "420.00",
+      "balanceBeforeDepositsTotal":      "420.00",
+      "depositsAvailableTotal":          "799.00",
+      "availableDepositApplied":         "420.00",
+      "paymentCreditRefund":             "0.00",
+      "depositRefund":                   "379.00",
+      "balanceOwed":                     "0.00"
+    },
+    "forwardingAddress": {"street": "...", "city": "...", "state": "FL", "zip": "..."},
+    "forwardingSource":  "resident"
+  },
+  "docs": {
+    "claimForm":              "out/Claim Form - <resident>.docx",
+    "fasPdf":                 "out/Final Account Statement 8-3-2026 - <resident>.pdf",
+    "combinedPdf":            "out/Move Out Docs - Unit <#>.pdf",
+    "combinedPdfDocumentId":  "<ResMan documentId returned by POST /Documents>"
+  },
+  "email": {
+    "sent": true, "to": "...", "subject": "...",
+    "attachedByResMan": [{"name": "...", "checked": true}],
+    "commLogVerified": true, "commLogRow": "8/3/2026 <resident> ..."
+  },
+  "docupost": {
+    "letterId":     "1785796086596x615321694122568600",
+    "cost":         12.33,
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "pdfUrl":       "https://raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/...",
+    "certification": {
+      "uploaded":   true,
+      "path":       "out/MO Docs - Mail Certification.png",
+      "documentId": "<ResMan documentId>",
+      "tracking":   "92071902358909000043674521",
+      "error":      null
+    }
+  },
+  "github": {"repo": "ymi-flowing/mo-process", "runUrl": "..."},
+  "logs":   ["hh:mm:ss ...", ...],
+  "error":  null
+}
+```
+
+## Claim Form field logic (the deposit math)
+
+Variables from `capture_mor_totals` (see [MOR totals capture](#mor-totals-capture)):
+- `openBal` = `currentOpenBalanceTotal` (may be negative = credit/overpayment)
+- `moCharges` = `finalMoveOutChargesCreditsTotal`
+- `deposits` = `depositsAvailableTotal` (sum of every Available Deposit line)
+- `depApplied` = `availableDepositApplied` (what ResMan actually pulled from deposit to zero the balance)
+- `depRefund` + `payRefund` = amounts going back to resident
+
+Filled by `generate_claim_form` (line references match paragraph indexes in `Claim Form Example.Docx`):
+
+| # | Field | Formula |
+|---|---|---|
+| 12 | Amount claimed against deposit | `depApplied` |
+| 14 | Property return address | from `properties.json` |
+| 18 | Amount of Security Deposit | `deposits` |
+| 19 | Credit from Overpayment | `abs(openBal) if openBal < 0 else 0` |
+| 20 | Total Security Deposit and Credit | `deposits + credit_over` |
+| 21 | Total Charges | `moCharges + max(0, openBal)` |
+| 23 | Landlord → Resident (refund) | `depRefund + payRefund` if positive & `balOwed == 0` |
+| 24 | Resident → Landlord (owed) | `balOwed` |
+| 30 | PM email | from `properties.json` |
+
+**Historical**: earlier revisions used `availableDepositApplied` (deposit *applied*) in fields 18/20, causing "Amount of Security Deposit" to show $650 instead of $999 when charges < deposit. Fixed by scraping the Totals row of ResMan's Available Deposit table.
+
+## MOR totals capture
+
+`capture_mor_totals` reads 8 fields from the MOR page before Approve:
+
+- **Text scrape by label** (last `<td>` of the row):
+  - `currentOpenBalanceTotal` ← "Current Open Balance Total"
+  - `finalMoveOutChargesCreditsTotal` ← "Final Move Out Charges / Credits Total"
+  - `balanceBeforeDepositsTotal` ← "Balance before Deposits Total"
+- **Totals row of the "Available Deposit" table** (sums across multi-deposit residents):
+  - `depositsAvailableTotal` ← the "Available Deposit" column of the row whose first cell is "Totals"
+- **Input value scrape** (form fields):
+  - `availableDepositApplied` ← `input[name*="ApplyToBalanceAmount"]`
+  - `paymentCreditRefund` ← `#PaymentRefundAmount`
+  - `depositRefund` ← `#CalculatedDepositRefundAmount`
+  - `balanceOwed` ← `#BalanceOwed`
+
+## Forwarding address
+
+Read via ResMan's **Lease Edit dialog** — click `.dialog-form-link` next to the Forwarding address block, wait for `#ForwardingAddress_StreetAddress` to render, grab the 5 structured fields (`StreetAddress` / `City` / `State` / `Zip` / `Country`), close the dialog with X (never Save).
+
+Fall back to `get_unit_address_via_new_tab()` (opens the Unit detail page) if the forwarding is blank.
+
+**Why not scrape the read-only cell?** Earlier revisions did; ResMan renders that cell in at least two DOM shapes (sibling `<div>`s vs plain text with `<br>`) that both collapsed under `textContent` and defeated the CSZ regex. The Edit dialog has stable IDs — zero parsing.
+
+## Merged PDF (Claim Form + FAS)
+
+Filename: `Move Out Docs - Unit <#>.pdf`. Falls back to `Move Out Docs - <resident-slug>.pdf` if the unit is unknown.
+
+The FAS PDF always has an "Images for Charges" trailing page — when no images were uploaded, that page is empty except for the header text. `merge_claim_and_fas_to_pdf` **strips** pages whose extracted text is *exactly* `"Images for Charges"` (case-insensitive), only from the FAS source. Guarded so a real page with header + images survives.
+
+Requires MS Word or LibreOffice for the docx → PDF conversion. CI installs LibreOffice.
 
 ## Multi-property support
 
-Properties are declared in `properties.json` at the repo root. Each entry drives the property-specific data on the Claim Form + Docupost sender:
+`properties.json` at repo root. Each entry drives the property-specific data on the Claim Form + Docupost sender:
 
 ```json
 {
@@ -36,68 +150,141 @@ Properties are declared in `properties.json` at the repo root. Each entry drives
     "state":    "FL",
     "zip":      "33781"
   },
-  "The Villas at Ortega": {
-    "proid":    null,
-    "email":    "pm@thevillasatortega.com",
-    "address1": "5327 Timuquana Rd",
-    "city":     "Jacksonville",
-    "state":    "FL",
-    "zip":      "32210"
-  }
+  "The Villas at Ortega": { ... }
 }
 ```
 
-**How the runner picks the property**, in order:
-1. `payload.property` if the caller passed an explicit name.
-2. `proid` GUID captured from the resident detail page's `#MoveOutReconciliationLink` `data-href` attribute (matched against DB entries with a non-null `proid`).
-3. Body-text substring match against DB keys.
+**Property resolution order** (`resolve_property`):
+1. `payload.property` explicit override.
+2. `proid` GUID from `#MoveOutReconciliationLink` data-href → match against DB entries with a non-null `proid`.
+3. Body-text substring match against DB keys (unique match required).
 
-If none of the above resolves, the runner raises **before** touching MOR — so a misconfigured property doesn't leave a half-completed reconciliation.
+If none resolves, the runner raises **before** touching MOR — no half-completed reconciliation.
 
-**What each field drives**:
-- `email` → Claim Form paragraph "If you wish to dispute or disagree with any charges, submit your request via email to the Property Manager at: `<email>`". The email dialog's From: is set independently by ResMan (`objectType === 'Property'`).
-- `address1` / `city` / `state` / `zip` → Claim Form return-address line (FL § 83.49(3) requires the landlord's mailing address on the notice) **and** the Docupost `from_*` sender fields.
-- `proid` → optional but recommended. Once you know a property's GUID (visible in the runner's `Property signals:` log line on the first run), pin it in the DB so future runs resolve via exact match instead of body-text.
+**Rendered claim-form samples** live in `examples/claim-form-samples/`.
 
-**To add a new property**:
-1. Add a top-level entry to `properties.json`. `proid` may start as `null` — the runner will fall back to body-text name match, which works as long as the DB key is a substring of what ResMan displays on the resident detail page.
-2. In ResMan, make sure the new property has an email template named `***MO Docs Email` (or override via `payload.email.template`). Without it, `apply_template` will time out AFTER MOR is approved.
-3. First real run: watch the `Property signals:` log line for the `proid` and pin it in the DB.
+## ResMan API (upload docs into resident's Documents tab)
 
-**Rendered samples** live in `examples/claim-form-samples/` — one Claim Form per property using synthetic resident data, so you can eyeball the property-specific paragraphs (return address, email) without opening a real resident's file.
+`POST https://partners-api.myresman.com/Documents` (multipart/form-data). Auth: Basic (`PartnerId:ApiKey`), plus `ResMan-Account-Id` header.
 
-## Input
-- Resident URL (e.g. `https://sns.myresman.com/#/Residents/Detail/<leaseId>`)
-- List of move-out charges: `{ description, amount }` (default category: `Cleaning/Damage Charges`)
+Body fields the runner sends:
+- `propertyId` = property GUID (from properties.json → `proid`)
+- `Id` = `oid` (BillingAccountId — extracted from MOR data-href query string)
+- `type` = `Lease`
+- `file` = merged PDF or cert PNG bytes
+- `fileName` = filename to display in Documents
+- `path` = `/Move-Out Docs` (folder auto-created if it doesn't exist)
+- `showInResidentPortal` = `false`
+
+Response returns `documentId` (logged into result JSON). Retries on Cloudflare 5xx (502/503/504) up to 3× with 65s backoff.
+
+**Failure policy**:
+- **Merged PDF upload = HARD-FAIL.** If it fails, the email step can't attach → whole run marked `status: error`.
+- **Cert PNG upload = SOFT-FAIL.** Letter is already mailed; cert is nice-to-have. Errors go to `result.docupost.certification.error`.
+
+## Certified mail via Docupost
+
+`POST https://app.docupost.com/api/1.1/wf/sendletter` — **params go in the query string, not the body.**
+
+Minimum working params:
+
+```
+api_token, pdf=<publicly reachable URL>,
+class=usps_first_class, servicelevel=certified,
+from_name, from_address1, from_city, from_state, from_zip,
+to_name,   to_address1,   to_city,   to_state,   to_zip
+color=false, doublesided=false, description=<internal ≤40 chars>
+```
+
+Gotchas learned the hard way:
+- `servicelevel=certified` **requires** `class=usps_first_class`. `usps_standard` silently ignores certified.
+- `pdf` must be **publicly reachable**. The runner pushes the merged PDF to `examples/` in this public repo via the GitHub Contents API and hands Docupost the `raw.githubusercontent.com` URL.
+- Response: `{status, letter_id, cost}` — only 3 fields, **no tracking number**. Tracking # is only available later on the Docupost dashboard.
+- Cost for a 3-page certified B&W single-sided letter: **~$12.33**.
+- Cancel test letters within 1 hour at https://docupost.com/letters to avoid charge.
+
+## Cert screenshot from Docupost dashboard
+
+`capture_docupost_certification()`:
+1. Opens `https://app.docupost.com/letter/<letter_id>` in a fresh browser context.
+2. Logs in with `DOCUPOST_WEB_USER` / `DOCUPOST_WEB_PASS`.
+3. Waits for the letter page (`Delivery Status` text).
+4. Polls up to **180s** for `USPS Tracking # <digits>` to appear in the body (Docupost can take 30-180s to publish tracking after sendletter).
+5. Screenshots the smallest `.bubble-element.Group` containing "Delivery Status" + "Recipient" + "Sender" — that's Bubble.io's middle-content column. Falls back to viewport screenshot if the panel selector misses.
+6. Saves as `out/MO Docs - Mail Certification.png`.
+7. Returns `(path, tracking_number)` — either may be `None` on soft failure.
+
+## Privacy tradeoff
+
+Every real resident's merged claim form briefly ends up as a public file at `raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move Out Docs - Unit <#>.pdf`. Docupost's fetcher needs a public URL, and GitHub raw was the only reliable host we tested (catbox.moe / tmpfiles.org failed). Rename or delete those files after each certified letter is safely mailed if that's a concern. Future work: Vercel Blob / Cloudflare R2 with short-TTL signed URLs — the runner's `push_pdf_to_repo(...)` helper is the only piece that would swap.
+
+## Input payload
+
+```json
+{
+  "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/<leaseId>",
+  "charges": [
+    { "description": "Cleaning",        "amount": 150.00 },
+    { "description": "Carpet Cleaning", "amount": 200.00 }
+  ],
+  "morDate": null,
+  "email": {
+    "enabled": true,
+    "from":    "property",
+    "template": "***MO Docs Email"
+  },
+  "docupost": {
+    "enabled": true,
+    "class":        "usps_first_class",
+    "servicelevel": "certified",
+    "color":        false,
+    "doublesided":  false
+  },
+  "outputDir": "out"
+}
+```
+
+- `charges[].category` optional (default `Cleaning/Damage Charges`).
+- `morDate` optional (defaults to today in `M/D/YYYY`).
+- `email.from`: `property` or `assistant`.
+- `docupost.enabled: false` skips the certified-mail step; the runner still uploads the docs and emails the resident.
 
 ## Run (local)
 
 ```
 pip install -r requirements.txt
 playwright install chromium
-python run_mo_process.py --payload @payload.example.json
-python run_mo_process.py --payload @payload.example.json --no-send   # dry-run: stop before Send
-python run_mo_process.py --payload @payload.example.json --headless  # CI
-python run_mo_process.py --payload -                                 # stdin JSON
+python run_mo_process.py --payload @payload.example.json                   # headed
+python run_mo_process.py --payload @payload.example.json --headless        # CI
+python run_mo_process.py --payload @payload.example.json --no-send         # dry-run: stop before Send
+python run_mo_process.py --payload -                                       # stdin JSON
 ```
 
 ## Trigger via HTTP (n8n → GitHub Actions)
 
-The `mo-process.yml` workflow accepts a `workflow_dispatch` payload with three inputs:
-- `payload` — the JSON payload (as a single-line string).
-- `resume_url` — n8n webhook URL to POST the final result JSON back to.
-- `no_send` — `true` for dry-run (skip the resident-email Send click).
+Workflow `mo-process.yml` accepts:
+- `payload` — the JSON payload (single-line string).
+- `resume_url` — n8n webhook URL to POST the final JSON back to.
+- `no_send` — `"true"` for dry-run.
 
-**Repo secrets to set once** (Settings → Secrets and variables → Actions):
-- `RESMAN_USER` — defaults to `SNS_Assistant` if unset.
-- `RESMAN_PASS` — defaults to the SNS_Assistant password if unset.
-- `DOCUPOST_TOKEN` — required for the certified-mail step; if missing, the runner skips Docupost and records `docupost.skipped = "no_docupost_token"`.
+**Repo secrets** (Settings → Secrets and variables → Actions):
 
-`GITHUB_TOKEN` is auto-provided by Actions and the workflow has `permissions: { contents: write }` so the runner can push the merged PDF into `examples/` via the Contents API.
+| Secret | Purpose |
+|---|---|
+| `RESMAN_USER` | ResMan web login (defaults to `SNS_Assistant`) |
+| `RESMAN_PASS` | ResMan web login |
+| `RESMAN_API_KEY` | ResMan Partner API — Basic auth password |
+| `RESMAN_PARTNER_ID` | ResMan Partner API — Basic auth username (`SNSaPi`) |
+| `RESMAN_ACCOUNT_ID` | ResMan Partner API — `ResMan-Account-Id` header (`1550`) |
+| `DOCUPOST_TOKEN` | Docupost sendletter API |
+| `DOCUPOST_WEB_USER` | Docupost dashboard login (for cert screenshot) |
+| `DOCUPOST_WEB_PASS` | Docupost dashboard login |
 
-> **Privacy tradeoff:** every real resident's merged claim form briefly ends up as a public file at `raw.githubusercontent.com/ymi-flowing/mo-process/main/examples/Move Out Docs - Unit <#>.pdf`. Rename / delete those files after each certified letter is safely mailed if that's a concern. A future change can move hosting to Vercel Blob / Cloudflare R2 with short-TTL signed URLs — the runner's `push_pdf_to_repo(...)` helper is the only piece that would swap.
+`GITHUB_TOKEN` is auto-provided by Actions; the workflow has `permissions: { contents: write }` so the runner can push the merged PDF into `examples/` via the Contents API.
 
-**n8n HTTP node to dispatch:**
+**Local dev fallback**: all creds also readable from `Cardentials.txt` (gitignored). Env wins.
+
+**n8n HTTP node to dispatch**:
 ```
 POST https://api.github.com/repos/ymi-flowing/mo-process/actions/workflows/mo-process.yml/dispatches
 Headers:
@@ -114,176 +301,32 @@ Body:
 }
 ```
 
-The workflow runs the Playwright script headless, POSTs the final result JSON to `resume_url`, and uploads `result.json` + `out/` as an artifact for post-mortem.
+## Importable n8n workflow
 
-### Result JSON — the shape n8n will get back
+`examples/n8n-workflow.json` — 6-node workflow: `Fillout Webhook → Transform Payload → Dispatch GH Actions → Wait for Runner Callback → Build Email HTML → Gmail Send`. Wait node uses POST (no `webhookSuffix`) so the bare `$execution.resumeUrl` matches; 30-min timeout so hangs eventually fail loud.
 
-Success → `examples/result-success.json`. Error → `examples/result-error.json`. Always these top-level keys: `status`, `startedAt`, `endedAt`, `durationSeconds`, `resident`, `mor`, `docs`, `email`, `docupost`, `github`, `logs`, `error`. `status` is one of `sent | sent_no_email | parked | error`.
-
-### Build a summary email in n8n
-
-`examples/n8n-email-builder.js` is a Code node that turns the run result into an SNS-branded HTML summary email (uses the tokens in `C:\Users\ymosh\Claude\ROI\email-guidelines.md`). It renders: status pill, resident block (name/unit/property/email + Open-in-ResMan link), charges list, reconciliation totals, forwarding address (with source), resident-email step result, and — when populated — the Docupost letter block. Downstream: pipe `htmlEmail` into a Gmail / SMTP node.
-
-### Importable n8n workflow
-
-`examples/n8n-workflow.json` — a ready-to-import 6-node workflow: `Fillout Webhook → Transform Payload → Dispatch GH Actions → Wait for Runner Callback → Build Email HTML → Gmail Send`. The transform node maps Fillout's `charges[]` (`description`, `finalAmount`) into the runner's `{description, amount}` shape and pulls `$execution.resumeUrl` for the callback. **After import, wire up two credentials:**
-
+**After import, wire two credentials**:
 - **HTTP Header Auth** for `Dispatch GH Actions` — `Authorization: Bearer <GitHub PAT with 'workflow' scope>`.
 - **Gmail OAuth2** for `Gmail Send` — signed in as the mailbox you want the summary from.
 
-The Fillout webhook payload we tested with:
-```json
-{
-  "processId": "5",
-  "residentUrl": "https://sns.myresman.com/#/Residents/Detail/<leaseId>",
-  "status": "Submitted",
-  "reviewedBy": "assistant@snsmgmt.com",
-  "managerNotes": "",
-  "charges": [
-    { "description": "Cleaning",        "originalAmount": 150, "finalAmount": 150, "adjustmentReason": "" },
-    { "description": "Carpet Cleaning", "originalAmount": 200, "finalAmount": 200, "adjustmentReason": "" }
-  ]
-}
-```
-The transform node uses `finalAmount` as `amount` (falling back to `originalAmount` when null) and defaults each charge's category to `Cleaning/Damage Charges` unless the Fillout item includes an explicit `category`.
-
-### Payload
-```json
-{
-  "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/<leaseId>",
-  "charges": [
-    { "description": "Cleaning",        "amount": 150.00 },
-    { "description": "Carpet Cleaning", "amount": 200.00 }
-  ],
-  "morDate": null,
-  "email": {
-    "enabled": true,
-    "from": "property",
-    "template": "***MO Docs Email"
-  },
-  "docupost": {
-    "enabled": true,
-    "class":        "usps_first_class",
-    "servicelevel": "certified",
-    "color":        false,
-    "doublesided":  false
-  },
-  "outputDir": "out"
-}
-```
-- `charges[].category` optional (default `Cleaning/Damage Charges`).
-- `morDate` optional (defaults to today in `M/D/YYYY`).
-- `email.from`: `property` (49th St - pm@49streetapts.com) or `assistant` (SNS_Assistant).
-- `docupost.enabled: false` (or omitting the block) skips the certified-mail step; the runner still uploads the docs and emails the resident.
-- Credentials via env: `RESMAN_USER`, `RESMAN_PASS` (defaults to SNS_Assistant); `DOCUPOST_TOKEN` (required for Docupost); `GITHUB_TOKEN` (auto-provided in Actions).
-
-### Result (stdout JSON)
-```json
-{
-  "leaseUrl": "...",
-  "morDate": "7/13/2026",
-  "morStatus": "Complete",
-  "totals": { "currentOpenBalanceTotal": "3,257.90", "balanceOwed": "2,708.90", ... },
-  "forwardingAddress": { "street": "...", "city": "...", "state": "FL", "zip": "..." },
-  "forwardingSource": "resident" | "unit",
-  "claimForm": "out/Claim Form - Dwaun Spigner.docx",
-  "fasPdf":    "out/Final Account Statement 7-13-2026 - Dwaun Spigner.pdf",
-  "emailSent": true,
-  "attachedByResMan": [ { "name": "...", "checked": true } ]
-}
-```
-
-## Credentials
-See `Cardentials.txt` — ResMan web login (SNS_Assistant) + Partners API keys.
-
-## Steps
-
-1. **Login**: `https://sns.myresman.com/` → auth form auto-fills; click "Sign in".
-2. **Open resident**: navigate to the resident detail URL.
-3. **Open Move Out Reconciliation**: in the left "Leasing Workflow" sidebar, click **Move Out Rec.** — this is the visible anchor `#MoveOutReconciliationLink` (there's also a hidden `#MoveOutReconciliationOpenLink` for un-started reconciliations; the visible one is the right entry point). ResMan's jQuery ajax handler rewrites `data-href` into `#/Transactions/MoveOutReconciliation?proid=…&oid=…&lid=…&perid=…`.
-4. **Move-out rec. date***: fill with today (M/D/YYYY).
-5. **Add each charge**: click **Add Charge / Credit** → set Category (Cleaning/Damage Charges), Description, Amount. Repeat for each additional charge. Amount total shows in "Final Move Out Charges / Credits Total".
-6. **Capture totals** to JSON:
-   - `currentOpenBalanceTotal`
-   - `finalMoveOutChargesCreditsTotal`
-   - `balanceBeforeDepositsTotal`
-   - `paymentCreditRefund`
-   - `depositRefund`
-   - `balanceOwed`
-7. **Capture forwarding address** (split into `street`, `unitNo`, `city`, `state`, `zip`, `county`). If blank on resident, follow the Unit link (`#/Units/Detail/<unitId>` from the Unit Information cell) and use the unit's address instead.
-8. **Approve**: click **Actions** button → **Approve** link (`#Approve`). ResMan redirects to `/#/Residents/RedirectToDetail?ulgid=…` and the workflow item flips to **Move Out Rec (Complete)**.
-9. **Generate Claim Form** by copying `Claim Form Example.Docx` and substituting the resident name + totals (see `Claim Form - <resident>.docx`). Numbers when no deposit:
-   - Amount of Security Deposit: $0.00
-   - Credit from Overpayment: $0.00
-   - Total Security Deposit and Credit: $0.00
-   - Total Charges: balanceOwed
-   - Total Due Landlord to Resident: $0.00
-   - Total Due Resident to Landlord: balanceOwed
-10. **Download Final Account Statement PDF** from Documents: ResMan auto-generates `Final Account Statement <date>.pdf` on Approve. Get the row's download href (`/Documents/Download?documentID=<uuid>`), then fetch via in-page `fetch(url, {credentials:'include'})`, base64-encode, decode locally to `.pdf`.
-11. **Upload the Claim Form** to Documents:
-    - Click **Add** button under Documents (`button.add-files`).
-    - Set file via file chooser → Name field auto-fills → click **OK**.
-12. **Email the docs to the resident**:
-    - Click the resident's email (mailto link) — opens ResMan's Send Email dialog.
-    - Set From to the property (`#FromObject` select — pick "49th St Apartments - pm@49streetapts.com"). Also mirror the display combobox: `#FromObjectInput.value = <option text>`.
-    - Click **Template** button → pick **`***MO Docs Email`** — this fills Subject "49th St Apartments - Move-Out Documents" and body. Template resets From — re-select the property after.
-    - Click **Add** button (email dialog's `#Add`) → **Add from ResMan** (`#btnAddFromCloud`) → check both **Claim Form - `<resident>`.docx** and **Final Account Statement `<date>`.pdf** → OK.
-    - Click **Send**.
-
 ## Files
-- `Cardentials.txt` — ResMan web login + API keys (**gitignored**).
+
+- `run_mo_process.py` — headed/headless Playwright runner (entry point).
 - `Claim Form Example.Docx` — template with FL statutory notice language.
-- `run_mo_process.py` — headed Playwright runner (entry point).
-- `payload.example.json` — sample input payload.
-- `requirements.txt`, `.env.example`, `.gitignore`.
-- `examples/` — a completed run's artifacts kept as a reference (unit 317, Dwaun Spigner):
-  - `mor-<resident>-<unit>.json` — captured totals, charges, forwarding address, MOR status.
-  - `Claim Form - <resident>.docx` — generated claim form.
-  - `Final Account Statement <date> - <resident>.pdf` — downloaded auto-generated FAS.
-  - `Move Out Docs - Unit <#>.pdf` — merged Claim Form + FAS (single PDF used for mailing; named by unit so residents' files index cleanly by unit).
+- `properties.json` — multi-property config.
+- `payload.example.json` / `payload.villas.json` — sample input payloads.
+- `Cardentials.txt` — creds for local dev (**gitignored**).
+- `send_email_only.py` — standalone helper: re-send the resident email for a resident whose MOR is already approved and merged PDF is already in Documents. Useful for recovery after a partial run.
+- `verify_comm_log.py` — standalone helper: dump Communication Log rows for a resident (headed) to debug send-verification issues.
+- `examples/` — completed runs kept as reference:
+  - `Claim Form - Dwaun Spigner.docx`, `Final Account Statement 7-13-26 - Dwaun Spigner.pdf` — a sample completed reconciliation.
+  - `Move Out Docs - <resident/unit>.pdf` — merged PDFs from real production runs (public — see privacy note above).
+  - `claim-form-samples/` — one Claim Form per property using synthetic resident data.
+  - `n8n-workflow.json`, `n8n-email-builder.js` — importable n8n bits.
+  - `result-success.json`, `result-error.json` — result JSON shape references.
+  - `mor-dwaun-317.json` — sample MOR totals capture.
 
-## Merging Claim Form + FAS into one PDF
-```python
-from docx2pdf import convert       # requires MS Word installed
-from pypdf import PdfWriter, PdfReader
+## Known IDs (for reference)
 
-convert(str(claim_form_docx))       # writes <name>.pdf beside the docx
-w = PdfWriter()
-for src in [claim_form_pdf, fas_pdf]:
-    for page in PdfReader(str(src)).pages:
-        w.add_page(page)
-w.write(str(combined_pdf))
-```
-Order matters: Claim Form is page 1, FAS follows. The merged PDF (`Move Out Docs - Unit <#>.pdf`) is what gets uploaded to ResMan, attached to the resident email, and mailed by Docupost.
-
-## Certified mail via Docupost
-Endpoint: `POST https://app.docupost.com/api/1.1/wf/sendletter` — **params go in the query string, not the body.**
-
-Minimum working params (from live testing):
-
-```
-api_token, pdf, class=usps_first_class, servicelevel=certified,
-from_name, from_address1, from_city, from_state, from_zip,
-to_name,   to_address1,   to_city,   to_state,   to_zip
-color=false, doublesided=false, description=<internal ≤40 chars>
-```
-
-Notes learned the hard way:
-- `servicelevel=certified` **requires** `class=usps_first_class`. Using `usps_standard` with `certified` silently ignores the certified request.
-- `pdf` must be a **publicly reachable URL** (no multipart/base64). Docupost's fetcher couldn't reach `catbox.moe` or `tmpfiles.org` — GitHub raw on a public repo works reliably.
-- Response: `{ "status": "Successfully queued. Cost: $X.XX ...", "letter_id": "<id>", "cost": <number> }`. Save `letter_id` — that's how you cancel or track the letter in Docupost's dashboard.
-- Docs say: "cancel any test letters within an hour to avoid being billed or having the mailpiece sent" — do this at https://docupost.com/letters.
-- Cost for a 3-page certified B&W single-sided letter: **~$12.33**.
-
-### Hosting the Combined PDF for Docupost
-Docupost fetches the PDF over the public internet. Options tried:
-- `catbox.moe`, `tmpfiles.org` — Docupost's helper returned `Temporary error connecting to DocuPost Helpers - S3`. Do not use.
-- **GitHub raw on a public repo** — worked first try (this repo).
-- Vercel Blob / Cloudflare R2 with signed URLs — better for prod (keeps PDFs private + short TTL). Not yet wired.
-
-## Known IDs (49th St Apartments)
+**49th St Apartments**
 - Property ID (`proid`): `a262aa42-7393-4d84-9bf5-ae1bff852b32`
-
-## Cases exercised
-- **cleuza alves ferreira batista** (unit 315) — no deposit, $1,000 in cleaning/damage charges added, balance owed $4,738.00.
-- _next: case with security deposit._
