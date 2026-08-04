@@ -2181,16 +2181,18 @@ def _maybe_send_docupost(
         log(f"Docupost skipped: forwarding address incomplete ({[k for k in required if not forwarding.get(k)]})")
         return {"skipped": "incomplete_address"}
 
-    # 1. Push the PDF and get its public raw URL. The pushed filename is
-    # `Unit <#> - <Resident>.pdf` so the Docupost dashboard shows something
-    # readable (URL-encoded "Move Out Docs - Unit 1511.pdf" was rendering as
-    # "201511.pdf"). Local + ResMan-Documents copy keeps its own name.
-    dp_parts = []
+    # 1. Push the PDF and get its public raw URL. Filename is JUST the unit
+    # number — Docupost's dashboard truncates long URL-encoded names from
+    # the front, so any name with spaces displayed as junk (e.g. `Unit 1213
+    # - RANDALL HUBERTY.pdf` → `20HUBERTY.pdf`). Bare `<unit>.pdf` is ASCII,
+    # no encoding, no truncation. Local + ResMan-Documents copy keeps its
+    # own name (`Move Out Docs - Unit <#>.pdf`).
     if resident_unit:
-        dp_parts.append(f"Unit {resident_unit}")
-    if resident_name:
-        dp_parts.append(resident_name)
-    dp_filename = (" - ".join(dp_parts) + ".pdf") if dp_parts else combined_pdf.name
+        dp_filename = f"{resident_unit}.pdf"
+    elif resident_name:
+        dp_filename = f"{safe_slug(resident_name)}.pdf"
+    else:
+        dp_filename = combined_pdf.name
 
     raw_url = push_pdf_to_repo(combined_pdf, repo=repo, token=token_gh, target_filename=dp_filename)
     if not _wait_raw_url_live(raw_url):
@@ -2227,7 +2229,12 @@ def _maybe_send_docupost(
     }
 
     cfg = dict(cfg)  # avoid mutating payload
-    cfg.setdefault("description", (" - ".join(dp_parts))[:40] or "Move Out")
+    desc_parts = []
+    if resident_unit:
+        desc_parts.append(f"Unit {resident_unit}")
+    if resident_name:
+        desc_parts.append(resident_name)
+    cfg.setdefault("description", (" - ".join(desc_parts))[:40] or "Move Out")
 
     return send_via_docupost(cfg, sender, recipient, raw_url, token_docupost)
 
