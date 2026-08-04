@@ -1119,14 +1119,25 @@ def attach_from_resman(
                 f"Attachment(s) not found in ResMan picker after {max_attempts} attempts: {filenames}"
             )
 
-        last_result = _check_files_in_picker(page, filenames)
-        log(f"Attachment check result: {last_result}")
+        # Retry the checkbox check WITHOUT closing the picker. The row can
+        # be in the DOM (wait_picker_has_files succeeded) but the checkbox
+        # not yet clickable (getBoundingClientRect().width==0) — layout
+        # settles a beat later. Closing + reopening the picker was pure
+        # overhead (Gabriel Tosella 2026-08-04, three round-trips wasted).
+        for check_attempt in range(1, 6):
+            last_result = _check_files_in_picker(page, filenames)
+            log(f"Attachment check result: {last_result}")
+            missing_now = [r["name"] for r in last_result if r.get("missing") or not r.get("checked")]
+            if not missing_now:
+                break
+            log(f"Picker check retry {check_attempt}: still missing/unchecked = {missing_now}; waiting 2s in-picker.")
+            page.wait_for_timeout(2000)
 
         missing = [r["name"] for r in last_result if r.get("missing") or not r.get("checked")]
         if not missing:
             break
 
-        log(f"Picker attempt {attempt}: still missing/unchecked = {missing}. Retrying.")
+        log(f"Picker attempt {attempt}: still missing/unchecked = {missing}. Retrying (reopen picker).")
         _cancel_attachment_picker(page)
         if attempt >= max_attempts:
             if fallback_local_paths:
@@ -2216,9 +2227,14 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
 
         # ------- Step 5: Resident email — attach merged PDF, send -------
         if email_enabled:
-            # ResMan indexes API-uploaded docs quickly, but give a small
-            # settle so the picker inventory is warm.
-            page.wait_for_timeout(2000)
+            # ResMan's attachment picker indexes API-uploaded docs on its own
+            # schedule; observed anywhere from 2s to 3+ minutes. Give it a
+            # generous settle before we even open the email dialog — the
+            # dialog cost (5-10s to open) is dwarfed by the cost of failing
+            # attach + running send_email_only.py after (Gabriel Tosella
+            # 2026-08-04). 15s catches the fast case; the picker's own
+            # retry loop handles slower cases.
+            page.wait_for_timeout(15000)
             open_send_email_dialog(page)
             set_from(page, from_pref)
             apply_template(page, template)
