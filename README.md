@@ -14,8 +14,8 @@ Login → open Move Out Rec → fill date + charges → capture totals → appro
       → capture cert screenshot from Docupost dashboard
       → ResMan API: POST /Documents  (merged PDF → /Move-Out Docs, HARD-fail)
       → ResMan API: POST /Documents  (cert PNG   → /Move-Out Docs, SOFT-fail)
-      → open Send Email → apply template → attach merged PDF from picker → Send
-         (falls back to "Add from Computer" if picker doesn't surface the file)
+      → open Send Email → apply template → attach merged PDF via
+         Add > Add from computer (nested modal, set_input_files + Ok) → Send
       → Comm Log verify (Kendo grid lazy-hydrate — waits up to 25s)
 ```
 
@@ -56,7 +56,7 @@ Always these top-level keys, always a JSON object even on error/crash. `status �
   },
   "email": {
     "sent": true, "to": "...", "subject": "...",
-    "attachedByResMan": [{"name": "...", "checked": true}],
+    "attachedByResMan": [{"name": "...", "checked": true, "source": "computer"}],
     "commLogVerified": true, "commLogRow": "8/3/2026 <resident> ..."
   },
   "docupost": {

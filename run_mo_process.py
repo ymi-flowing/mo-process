@@ -32,9 +32,8 @@ FLOW (in order)
  14. ResMan API POST /Documents — upload cert PNG to /Move-Out Docs
      (SOFT-FAIL: letter is already mailed).
  15. Open resident email, apply ***MO Docs Email template, attach the
-     merged PDF from ResMan's picker (expands /Move-Out Docs folder;
-     falls back to "Add from Computer" if the picker doesn't surface
-     the file after retries). Click Send.
+     merged PDF via Add > Add from computer (opens a nested modal;
+     uses set_input_files on its file input then clicks Ok). Click Send.
  16. Verify via Communication Log (Kendo grid lazy-hydrates — waits 10s
      then retries once at 15s).
 
@@ -1987,12 +1986,12 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
         #   2. Cert screenshot from Docupost dashboard
         #   3. API-upload merged PDF to /Move-Out Docs   (HARD-FAIL)
         #   4. API-upload cert PNG   to /Move-Out Docs   (soft-fail)
-        #   5. Resident email: open dialog, attach merged PDF from ResMan
-        #      picker (with folder-expand + Add-from-Computer fallback), send
+        #   5. Resident email: open dialog, attach merged PDF via
+        #      'Add > Add from computer' (nested modal), click Send
         #   6. Comm Log verify
-        # No more Playwright button.add-files uploads — the API handles both
-        # files, avoiding the accordion-visibility flakiness that broke runs
-        # 30291119947 and 30858602298.
+        # The 'Add from ResMan' picker was dropped 2026-08-04 — checkbox
+        # scraping was consistently flaky against ResMan's Kendo grid, and
+        # the merged PDF is on disk anyway (that's what we just API-uploaded).
         # ============================================================
 
         # ------- Step 1: Docupost sendletter -------
@@ -2054,9 +2053,10 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                     log(f"Docupost cert capture crashed: {e}")
 
         # ------- Step 3: API-upload merged PDF (HARD-FAIL) -------
-        # This must succeed for the email step (attach picker looks for the
-        # file in ResMan Documents). Bubble any error up to the top-level
-        # exception handler which marks the run as error.
+        # Merged PDF must be in ResMan Documents so residents/staff can
+        # find the mailed docs later. Attach step uses the local file, so
+        # this failure only blocks the "in Documents" side — but per policy
+        # (README) we treat it as fatal so a bad run doesn't slip through.
         oid = mor_info.get("oid")
         property_id = (
             (prop_cfg or {}).get("proid")

@@ -53,7 +53,7 @@
     "template": "***MO Docs Email",
     "subject": "49th St Apartments - Move-Out Documents",
     "attachedByResMan": [
-      { "name": "Move Out Docs - Unit 1511.pdf", "checked": true }
+      { "name": "Move Out Docs - Unit 1511.pdf", "checked": true, "source": "computer" }
     ],
     "commLogVerified": true,
     "commLogRow": "8/3/2026 Beatriz Pestana Gonzalez 49th St Apartments - Move-Out Documents Email"
