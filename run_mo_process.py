@@ -1608,27 +1608,28 @@ def resident_name_from_page(page: Page) -> str:
 
 
 def unit_number_from_page(page: Page) -> str:
-    """Return the resident's unit identifier preserving any letter prefix/suffix
-    (e.g. ``T135``, ``135``, ``135B``). ResMan's resident header always has a
-    ``<td id="HeaderUnitNumber">Unit <#></td>`` — the stable selector. Old
-    approach scanned every ``<td>`` and matched the first starting with
-    "Unit ", but silently returned blank when we hit the page too early
-    (Mia Renfro 2026-08-04) or when the "Unit* 707D Renovated..." unit-type
-    row was the only match (asterisk broke the ^Unit\\s+ anchor)."""
+    """Return the resident's unit identifier verbatim. ResMan's resident header
+    always has a ``<td id="HeaderUnitNumber">Unit <#></td>`` — the stable
+    selector. Match everything after "Unit " up to whitespace, allowing letters,
+    digits, dash, and slash so real-world formats survive intact:
+    ``T135``, ``135B``, ``4749-9`` (dash segment), ``69C1`` (letter mid-value).
+    Prior regex ``[A-Za-z]*\\d+[A-Za-z]*`` truncated at the first non-alphanum,
+    dropping the ``-9`` and ``1`` from those examples."""
     try:
         page.wait_for_selector('#HeaderUnitNumber', timeout=8000)
     except PWTimeout:
         pass  # fall through to the scan below
     return page.evaluate(
         r"""() => {
+          const RX = /Unit\s+([A-Za-z0-9][A-Za-z0-9\-\/]*)/;
           const header = document.querySelector('#HeaderUnitNumber');
           if (header) {
-            const m = (header.textContent || '').match(/Unit\s+([A-Za-z]*\d+[A-Za-z]*)/);
+            const m = (header.textContent || '').match(RX);
             if (m) return m[1];
           }
           const cells = Array.from(document.querySelectorAll('td'));
-          const cell  = cells.find(c => /^Unit\s+[A-Za-z]*\d+[A-Za-z]*\b/.test(c.textContent.trim()));
-          return cell ? (cell.textContent.match(/^Unit\s+([A-Za-z]*\d+[A-Za-z]*)/) || ['',''])[1] : '';
+          const cell  = cells.find(c => /^Unit\s+[A-Za-z0-9]/.test(c.textContent.trim()));
+          return cell ? (cell.textContent.match(RX) || ['',''])[1] : '';
         }"""
     )
 
