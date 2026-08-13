@@ -503,6 +503,11 @@ def approve_mor(page: Page):
     log("Actions -> Approve")
     page.locator('#Actions').click()
     page.locator('#Approve').click()
+    # ResMan now opens an "Approve MOR" confirmation dialog with an Internal
+    # Notes textarea and a second "Approve MOR" button. Confirm it to proceed.
+    dialog = page.locator('div.ui-dialog:has(#ui-dialog-title-1:has-text("Approve MOR"))')
+    dialog.wait_for(state="visible", timeout=10000)
+    dialog.locator('.ui-dialog-buttonset button:has-text("Approve MOR")').click()
     # Approve redirects to /#/Residents/RedirectToDetail?ulgid=... and eventually
     # to the resident detail page. Wait for the Leasing Workflow to show Complete.
     page.wait_for_function(
