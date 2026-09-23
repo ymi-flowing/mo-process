@@ -245,7 +245,7 @@ Every real resident's merged claim form briefly ends up as a public file at `raw
 ```
 
 - `charges[].category` optional (default `Cleaning/Damage Charges`).
-- `morDate` optional (defaults to today in `M/D/YYYY`).
+- `morDate` optional (`M/D/YYYY`). When omitted, the runner reads the resident's Move-out date from ResMan: future → uses the move-out date, past → uses today. Explicit `morDate` always wins.
 - `email.from`: `property` or `assistant`.
 - `docupost.enabled: false` skips the certified-mail step; the runner still uploads the docs and emails the resident.
 
