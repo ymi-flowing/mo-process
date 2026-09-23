@@ -283,6 +283,19 @@ def today_str():
     return f"{n.month}/{n.day}/{n.year}"
 
 
+def _parse_us_date(s: str | None) -> datetime | None:
+    """Parse ResMan's M/D/YYYY format. Returns None if unparseable."""
+    if not s:
+        return None
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
+
+
 def money(x):
     """Format a Decimal/float as ResMan-style '4,738.00'."""
     return f"{float(x):,.2f}"
@@ -381,6 +394,36 @@ def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | N
         timeout=30000,
     )
     return info
+
+
+def read_resident_move_out_date(page: Page) -> str | None:
+    """Read the resident's Move-out date (M/D/YYYY) from the MOR page."""
+    return page.evaluate(
+        r"""() => {
+          const t = document.body.innerText || '';
+          const m = t.match(/Move[- ]out date\s+(\d{1,2}\/\d{1,2}\/\d{4})/i);
+          return m ? m[1] : null;
+        }"""
+    )
+
+
+def pick_effective_mor_date(payload_mor_date: str | None, page: Page) -> str:
+    # ResMan blocks Approve when MOR date < move-out date and shows only
+    # a red tooltip; the runner then hangs waiting for a dialog that never
+    # opens. Future move-outs → use the move-out date; past → use today.
+    if payload_mor_date:
+        return payload_mor_date
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    mo_raw = read_resident_move_out_date(page)
+    mo_dt = _parse_us_date(mo_raw)
+    if mo_dt and mo_dt > today:
+        log(f"Move-out date {mo_raw} is in the future; using it as MOR date.")
+        return mo_raw
+    if mo_dt:
+        log(f"Move-out date {mo_raw} is on/before today; using today as MOR date.")
+    else:
+        log("Move-out date not found on page; defaulting MOR date to today.")
+    return today_str()
 
 
 def fill_mor_date(page: Page, mor_date: str):
@@ -503,11 +546,55 @@ def approve_mor(page: Page):
     log("Actions -> Approve")
     page.locator('#Actions').click()
     page.locator('#Approve').click()
-    # ResMan now opens an "Approve MOR" confirmation dialog with an Internal
-    # Notes textarea and a second "Approve MOR" button. Confirm it to proceed.
-    dialog = page.locator('div.ui-dialog:has(#ui-dialog-title-1:has-text("Approve MOR"))')
-    dialog.wait_for(state="visible", timeout=10000)
-    dialog.locator('.ui-dialog-buttonset button:has-text("Approve MOR")').click()
+    # Selector chain survives jQuery UI id numbering drift (was
+    # #ui-dialog-title-1, but a prior dialog on the page bumps this to -2+)
+    # and a possible Kendo swap. Same pattern as send_letters.py after the
+    # mid-Sep 2026 ResMan Kendo update. Diagnostic dump on total miss.
+    dialog_candidates = [
+        page.locator('div.ui-dialog:has(.ui-dialog-title:has-text("Approve MOR"))').first,
+        page.locator('div.k-window:has(.k-window-title:has-text("Approve MOR"))').first,
+        page.locator('[role="dialog"]:has-text("Approve MOR")').first,
+    ]
+    dialog = None
+    for cand in dialog_candidates:
+        try:
+            cand.wait_for(state="visible", timeout=4000)
+            dialog = cand
+            break
+        except PWTimeout:
+            continue
+    if dialog is None:
+        try:
+            Path("out").mkdir(exist_ok=True)
+            page.screenshot(path="out/approve-dialog-miss.png", full_page=True)
+            snapshot = page.evaluate(
+                r"""() => Array.from(document.querySelectorAll(
+                    'div.ui-dialog, div.k-window, .modal.show, .modal.in, [role="dialog"], [role="alertdialog"]'
+                )).map(n => ({
+                    id: n.id, cls: n.className, role: n.getAttribute('role'),
+                    visible: n.offsetParent !== null,
+                    titles: Array.from(n.querySelectorAll('.ui-dialog-title, .k-window-title, .modal-title, [id^=ui-dialog-title]'))
+                                   .map(t => (t.textContent || '').trim()),
+                }))"""
+            )
+            log(f"Approve MOR dialog not found. Dialogs on page: {snapshot}")
+        except Exception as diag_err:
+            log(f"(diagnostic dump failed: {diag_err})")
+        raise PWTimeout('Approve MOR confirmation dialog did not appear (no known selector matched).')
+    confirm_candidates = [
+        dialog.locator('.ui-dialog-buttonset button:has-text("Approve MOR")').first,
+        dialog.locator('.k-window-actions button:has-text("Approve MOR")').first,
+        dialog.get_by_role('button', name='Approve MOR').first,
+    ]
+    for btn in confirm_candidates:
+        try:
+            btn.wait_for(state="visible", timeout=3000)
+            btn.click()
+            break
+        except PWTimeout:
+            continue
+    else:
+        raise PWTimeout('Approve MOR confirm button not found inside dialog.')
     # Approve redirects to /#/Residents/RedirectToDetail?ulgid=... and eventually
     # to the resident detail page. Wait for the Leasing Workflow to show Complete.
     page.wait_for_function(
@@ -1822,7 +1909,7 @@ def _find_existing_merged_pdf(out_dir: Path, unit: str, resident_name: str) -> P
 def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict:
     lease_url = payload["leaseUrl"]
     charges   = payload["charges"]
-    mor_date  = payload.get("morDate") or today_str()
+    mor_date  = payload.get("morDate")  # may be None; resolved after MOR page loads
     email_cfg = payload.get("email") or {}
     email_enabled = email_cfg.get("enabled", True) and send
     from_pref = email_cfg.get("from", "property")
@@ -1908,6 +1995,8 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
         combined = None
 
         if not resume:
+            mor_date = pick_effective_mor_date(mor_date, page)
+            result["mor"]["date"] = mor_date
             fill_mor_date(page, mor_date)
             for c in charges:
                 add_charge(page,
@@ -1923,6 +2012,9 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             result["mor"]["status"] = "Complete"
         else:
             result["mor"]["status"] = "Complete (resume)"
+            if not mor_date:
+                mor_date = today_str()
+                result["mor"]["date"] = mor_date
             # Re-visit the detail page to pick up the resident info that
             # normally lands after Approve navigates back here.
             page.goto(lease_url, wait_until="domcontentloaded")
