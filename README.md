@@ -244,6 +244,7 @@ Every real resident's merged claim form briefly ends up as a public file at `raw
 }
 ```
 
+- `charges` optional. Pass `[]` or omit entirely for a full-refund MOR (Approve with no line items; Claim form + Docupost still generated with a $0 claim).
 - `charges[].category` optional (default `Cleaning/Damage Charges`).
 - `morDate` optional (`M/D/YYYY`). When omitted, the runner reads the resident's Move-out date from ResMan: future → uses the move-out date, past → uses today. Explicit `morDate` always wins.
 - `email.from`: `property` or `assistant`.

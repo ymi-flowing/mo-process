@@ -46,7 +46,7 @@ USAGE
 PAYLOAD (single object)
     {
       "leaseUrl": "https://sns.myresman.com/#/Residents/Detail/<leaseId>",
-      "charges": [
+      "charges": [                        // optional; [] or omitted = full-refund MOR
         { "description": "Cleaning",        "amount": 150.00 },
         { "description": "Carpet Cleaning", "amount": 200.00 }
       ],
@@ -1908,7 +1908,7 @@ def _find_existing_merged_pdf(out_dir: Path, unit: str, resident_name: str) -> P
 
 def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict:
     lease_url = payload["leaseUrl"]
-    charges   = payload["charges"]
+    charges   = payload.get("charges") or []
     mor_date  = payload.get("morDate")  # may be None; resolved after MOR page loads
     email_cfg = payload.get("email") or {}
     email_enabled = email_cfg.get("enabled", True) and send
@@ -1998,6 +1998,8 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             mor_date = pick_effective_mor_date(mor_date, page)
             result["mor"]["date"] = mor_date
             fill_mor_date(page, mor_date)
+            if not charges:
+                log("No charges in payload — full-refund MOR (Approve with $0 claim).")
             for c in charges:
                 add_charge(page,
                            description=c["description"],
