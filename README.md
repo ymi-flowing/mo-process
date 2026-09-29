@@ -9,7 +9,8 @@ Automates closing out a former resident's Final Account Statement in ResMan and 
 ```
 Login → open Move Out Rec → fill date + charges → capture totals → approve
       → resident info (name/unit/email) + forwarding address (via Lease Edit dialog)
-      → generate Claim Form docx → download FAS PDF → merge (strip empty page)
+      → generate Claim Form docx → poll Documents tab up to 30s for FAS PDF
+      → merge (strip empty page) → HARD-FAIL if Docupost enabled but merge missing
       → Docupost sendletter (push PDF to public repo, POST /sendletter)
       → capture cert screenshot from Docupost dashboard
       → ResMan API: POST /Documents  (merged PDF → /Move-Out Docs, HARD-fail)
@@ -181,6 +182,17 @@ Response returns `documentId` (logged into result JSON). Retries on Cloudflare 5
 **Failure policy**:
 - **Merged PDF upload = HARD-FAIL.** If it fails, the email step can't attach → whole run marked `status: error`.
 - **Cert PNG upload = SOFT-FAIL.** Letter is already mailed; cert is nice-to-have. Errors go to `result.docupost.certification.error`.
+
+## No partial packets
+
+The runner raises **before any delivery step** (Docupost, resident email, ResMan upload) when it can't produce every artifact the payload asked for. Concretely:
+
+- **Property unresolved** → raise before touching MOR (see [Multi-property support](#multi-property-support)).
+- **FAS PDF not found on Documents tab within 30s AND `docupost.enabled ≠ false`** → raise before the resident email (`run_mo_process.py:2043` area). Introduced 2026-09-29 after MO Process run 36573610847 silently downgraded and shipped a claim-form-only email while skipping Docupost.
+- **docx → PDF conversion failed AND `docupost.enabled ≠ false`** → raise before the resident email. LibreOffice or MS Word must be installed.
+- **Merged PDF API-upload to ResMan failed** → the email step can't attach → whole run marked `status: error` (see above).
+
+Rule: a run either delivers every requested artifact (`status: "sent"`), or halts loudly (`status: "error"`) so a human can finish it manually. A run must never ship a subset of the requested payload as success.
 
 ## Certified mail via Docupost
 
