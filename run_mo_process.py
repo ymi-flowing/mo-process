@@ -899,7 +899,12 @@ def generate_claim_form(
 # ----------------------------- Documents I/O -------------------------------
 
 def download_fas_pdf(page: Page, out_dir: Path, resident_name: str, date_str: str) -> Path | None:
-    """Find the auto-generated Final Account Statement <date>.pdf and save it locally."""
+    """Find the auto-generated Final Account Statement <date>.pdf and save it locally.
+
+    ResMan generates the FAS asynchronously after MOR Approve; a single
+    look raced the async render on run 36573610847 (2026-09-29) and
+    returned a silent None. We now poll every 2s for up to 30s.
+    """
     # Expand Documents accordion.
     page.evaluate(
         r"""() => {
@@ -908,19 +913,30 @@ def download_fas_pdf(page: Page, out_dir: Path, resident_name: str, date_str: st
           h?.click();
         }"""
     )
-    page.wait_for_timeout(1500)
-    info = page.evaluate(
-        r"""() => {
-          const el = Array.from(document.querySelectorAll('.document-name'))
-            .find(x => x.textContent.trim().toLowerCase().includes('final account statement'));
-          if (!el) return null;
-          const row = el.closest('.document-row-grid');
-          const dl  = row?.querySelector('a[href*="/Documents/Download"]');
-          return { name: el.textContent.trim(), href: dl?.getAttribute('href') };
-        }"""
-    )
+    info = None
+    remaining_ms = 30_000
+    attempt = 0
+    while remaining_ms > 0:
+        attempt += 1
+        page.wait_for_timeout(2000)
+        remaining_ms -= 2000
+        info = page.evaluate(
+            r"""() => {
+              const el = Array.from(document.querySelectorAll('.document-name'))
+                .find(x => x.textContent.trim().toLowerCase().includes('final account statement'));
+              if (!el) return null;
+              const row = el.closest('.document-row-grid');
+              const dl  = row?.querySelector('a[href*="/Documents/Download"]');
+              return { name: el.textContent.trim(), href: dl?.getAttribute('href') };
+            }"""
+        )
+        if info and info.get("href"):
+            break
+        if attempt == 1 or attempt % 5 == 0:
+            log(f"FAS PDF not on Documents tab yet (attempt {attempt}); polling…")
+
     if not info or not info.get("href"):
-        log("Final Account Statement PDF not found on Documents tab.")
+        log("Final Account Statement PDF not found on Documents tab after 30s polling.")
         return None
 
     log(f"Downloading FAS PDF: {info['name']}")
@@ -2068,6 +2084,25 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                 )
                 if combined:
                     result["docs"]["combinedPdf"] = str(combined)
+
+            # Hard-fail before the resident-email step if Docupost is enabled
+            # but we couldn't build the merged packet. Silently continuing
+            # would ship the claim-form docx alone (run 36573610847,
+            # 2026-09-29 shipped a partial packet to Tracy Agenor). Halt
+            # loudly so a human can intervene.
+            _dp_enabled = (payload.get("docupost") or {}).get("enabled") is not False
+            if _dp_enabled and not fas_path:
+                raise RuntimeError(
+                    "Docupost is enabled but the Final Account Statement PDF "
+                    "was not found on the resident's Documents tab within 30s. "
+                    "Refusing to send a partial packet — resolve manually."
+                )
+            if _dp_enabled and fas_path and not combined:
+                raise RuntimeError(
+                    "Docupost is enabled but the merged Claim Form + FAS PDF "
+                    "could not be produced (docx→PDF conversion failed). "
+                    "Refusing to send a partial packet — resolve manually."
+                )
         else:
             combined = _find_existing_merged_pdf(
                 out_dir, unit=result["resident"]["unit"] or "", resident_name=resident_name,
@@ -2121,8 +2156,15 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                 log(f"Docupost step failed: {type(e).__name__}: {e}")
                 result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
         elif dp_enabled and not combined:
-            log("Docupost skipped: no Combined PDF was produced (docx→PDF failed).")
-            result["docupost"] = {"skipped": "no_combined_pdf"}
+            # Defensive: earlier code paths (fresh run and --resume) already
+            # raise when Docupost is enabled and the combined PDF is missing.
+            # Raising here too so a future flow-change that reintroduces the
+            # silent-skip bug is caught immediately instead of shipping a
+            # partial packet to the resident.
+            raise RuntimeError(
+                "Docupost is enabled but no combined PDF was produced. "
+                "Refusing to skip — resolve manually."
+            )
         else:
             log("Docupost skipped: docupost.enabled=false in payload.")
             result["docupost"] = {"skipped": "disabled_in_payload"}
