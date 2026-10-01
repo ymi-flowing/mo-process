@@ -92,6 +92,7 @@ def main():
             context = browser.new_context(viewport={"width": 1600, "height": 1200})
         else:
             context = browser.new_context(no_viewport=True)
+        mo.install_pendo_killer(context)
         page = context.new_page()
 
         try:

@@ -334,19 +334,82 @@ def login(page: Page):
     kill_pendo(page)
 
 
-def kill_pendo(page: Page):
-    """ResMan ships a Pendo product-tour overlay that (a) mounts backdrop
-    elements like #pendo-backdrop-3 that intercept pointer events, and (b)
-    when a guide opens, sets `inert` and `aria-hidden="true"` on the whole
-    SPA wrapper (#wrapper), making every element inside visible but
-    completely uninteractable — clicks land on `<body>`, focus() is
-    ignored, and elementFromPoint returns body/html because inert-subtree
-    elements are removed from the hit-test tree. Removing pendo elements
-    alone does NOT undo the inert attributes pendo set. Strip both.
+_PENDO_KILLER_INIT_SCRIPT = r"""
+(function () {
+  const stripInert = () => {
+    document.querySelectorAll('[inert]').forEach(el => {
+      try { el.removeAttribute('inert'); } catch (e) {}
+    });
+    document.querySelectorAll('div[aria-hidden="true"], main[aria-hidden="true"], section[aria-hidden="true"], body[aria-hidden="true"]').forEach(el => {
+      try { el.removeAttribute('aria-hidden'); } catch (e) {}
+    });
+  };
+  const killPendo = () => {
+    document.querySelectorAll('[id^="pendo-"]').forEach(el => {
+      try { el.remove(); } catch (e) {}
+    });
+    stripInert();
+  };
+  const setup = () => {
+    killPendo();
+    new MutationObserver(muts => {
+      let touched = false;
+      for (const m of muts) {
+        if (m.type === 'attributes' && (m.attributeName === 'inert' || m.attributeName === 'aria-hidden')) {
+          touched = true;
+          continue;
+        }
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if ((n.id || '').startsWith('pendo-')) {
+            try { n.remove(); } catch (e) {}
+            touched = true;
+            continue;
+          }
+          if (n.querySelectorAll) {
+            n.querySelectorAll('[id^="pendo-"]').forEach(el => {
+              try { el.remove(); } catch (e) {}
+              touched = true;
+            });
+          }
+        }
+      }
+      if (touched) stripInert();
+    }).observe(document.documentElement, {
+      childList: true, subtree: true,
+      attributes: true, attributeFilter: ['inert', 'aria-hidden']
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setup);
+  } else {
+    setup();
+  }
+})();
+"""
 
-    Call defensively before any click into the MOR screen (ResMan triggers
-    these product tours on route change). Ported from Send Lease, where the
-    same pattern froze the Create Lease wizard."""
+
+def install_pendo_killer(context):
+    """Install a persistent Pendo-killer on every page/navigation in this
+    browser context. ResMan ships a Pendo product-tour overlay that
+    (a) mounts backdrop elements like #pendo-backdrop-3 that intercept
+    pointer events, and (b) sets `inert` + `aria-hidden="true"` on the
+    SPA wrapper, making every element inside visible but uninteractable.
+
+    A one-shot cleanup after login is not enough: Pendo re-injects on
+    route changes (e.g. after Approve MOR, before the email dialog's
+    Template button). The MutationObserver installed here strips pendo
+    nodes AND the inert/aria-hidden attributes as fast as Pendo adds
+    them, so clicks land on the real target throughout the whole run.
+
+    Ported from Send Lease (same pattern froze the Create Lease wizard
+    mid-Sep 2026)."""
+    context.add_init_script(_PENDO_KILLER_INIT_SCRIPT)
+
+
+def kill_pendo(page: Page):
+    """One-shot Pendo cleanup — defensive belt-and-suspenders alongside
+    install_pendo_killer(). Safe to call anywhere; errors swallowed."""
     try:
         page.evaluate(r"""() => {
           document.querySelectorAll('[id^="pendo-"]').forEach(el => {
@@ -2015,6 +2078,7 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             context = browser.new_context(viewport={"width": 1600, "height": 1200})
         else:
             context = browser.new_context(no_viewport=True)
+        install_pendo_killer(context)
         page = context.new_page()
 
         login(page)
