@@ -331,6 +331,38 @@ def login(page: Page):
                   && !/Account\/Login/i.test(location.href)""",
         timeout=45000,
     )
+    kill_pendo(page)
+
+
+def kill_pendo(page: Page):
+    """ResMan ships a Pendo product-tour overlay that (a) mounts backdrop
+    elements like #pendo-backdrop-3 that intercept pointer events, and (b)
+    when a guide opens, sets `inert` and `aria-hidden="true"` on the whole
+    SPA wrapper (#wrapper), making every element inside visible but
+    completely uninteractable — clicks land on `<body>`, focus() is
+    ignored, and elementFromPoint returns body/html because inert-subtree
+    elements are removed from the hit-test tree. Removing pendo elements
+    alone does NOT undo the inert attributes pendo set. Strip both.
+
+    Call defensively before any click into the MOR screen (ResMan triggers
+    these product tours on route change). Ported from Send Lease, where the
+    same pattern froze the Create Lease wizard."""
+    try:
+        page.evaluate(r"""() => {
+          document.querySelectorAll('[id^="pendo-"]').forEach(el => {
+            try { el.remove(); } catch(e) {}
+          });
+          document.querySelectorAll('[inert]').forEach(el => {
+            try { el.removeAttribute('inert'); } catch(e) {}
+          });
+          document.querySelectorAll('[aria-hidden="true"]').forEach(el => {
+            if (el.tagName === 'DIV' || el.tagName === 'MAIN' || el.tagName === 'SECTION' || el.tagName === 'BODY') {
+              try { el.removeAttribute('aria-hidden'); } catch(e) {}
+            }
+          });
+        }""")
+    except Exception:
+        pass
 
 
 # ------------------------------ MOR steps ----------------------------------
@@ -544,6 +576,7 @@ def capture_mor_totals(page: Page) -> dict:
 
 def approve_mor(page: Page):
     log("Actions -> Approve")
+    kill_pendo(page)
     page.locator('#Actions').click()
     page.locator('#Approve').click()
     # Selector chain survives jQuery UI id numbering drift (was
