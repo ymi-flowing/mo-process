@@ -2145,10 +2145,16 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
         log(f"Resident: {resident_name!r} unit {result['resident']['unit']!r}")
 
         fwd = get_forwarding_address(page)
-        if fwd and fwd.get("street"):
+        # A raw truthy-check on `street` lets sentinel values like "N/A"
+        # satisfy the "resident gave an address" branch — the unit-address
+        # fallback never fires, city/state/zip stay null, and Docupost
+        # silently skips on 'incomplete_address'. Normalize + reject.
+        _street_norm = ((fwd or {}).get("street") or "").strip().upper()
+        _BLANK_SENTINELS = {"N/A", "NA", "N\\A", "NONE", "NIL", "-", "--", "."}
+        if _street_norm and _street_norm not in _BLANK_SENTINELS:
             result["mor"]["forwardingSource"] = "resident"
         else:
-            log("Forwarding blank -> falling back to unit address.")
+            log(f"Forwarding blank or sentinel ({_street_norm!r}) -> falling back to unit address.")
             fwd = get_unit_address_via_new_tab(context, page) or {}
             result["mor"]["forwardingSource"] = "unit"
         result["mor"]["forwardingAddress"] = fwd
@@ -2238,8 +2244,15 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             log(f"Docupost sendletter skipped: reusing existing letterId={existing_letter_id}")
             result["docupost"] = {"letterId": existing_letter_id, "reused": True}
         elif dp_enabled and combined:
+            # Docupost MUST succeed when enabled. A pre-flight return of
+            # {'skipped': reason} (missing token, incomplete address, raw
+            # URL not live) or any exception from send_via_docupost means
+            # the certified letter did NOT go out — treat both as fatal.
+            # The old except handler stored exceptions as {'skipped': ...}
+            # and the pre-flight returns slid straight through, so n8n got
+            # status='sent' while a certified-mail resident got nothing.
             try:
-                result["docupost"] = _maybe_send_docupost(
+                _dp_result = _maybe_send_docupost(
                     cfg=dp_cfg,
                     combined_pdf=combined,
                     resident_name=result["resident"]["name"],
@@ -2250,8 +2263,17 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                     property_name=prop_name,
                 )
             except Exception as e:
-                log(f"Docupost step failed: {type(e).__name__}: {e}")
-                result["docupost"] = {"skipped": f"{type(e).__name__}: {e}"}
+                raise RuntimeError(
+                    f"Docupost send failed: {type(e).__name__}: {e}. "
+                    "Refusing to report success — resolve manually."
+                )
+            if isinstance(_dp_result, dict) and "skipped" in _dp_result:
+                raise RuntimeError(
+                    f"Docupost is enabled but was not sent "
+                    f"(reason={_dp_result['skipped']!r}). "
+                    "Refusing to report success — resolve manually."
+                )
+            result["docupost"] = _dp_result
         elif dp_enabled and not combined:
             # Defensive: earlier code paths (fresh run and --resume) already
             # raise when Docupost is enabled and the combined PDF is missing.
@@ -2267,29 +2289,33 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             result["docupost"] = {"skipped": "disabled_in_payload"}
 
         # ------- Step 2: Mail certification screenshot from Docupost dashboard -------
+        # The certified letter is already mailed at this point (irreversible).
+        # If the cert screenshot or its upload cannot be produced, treat it as
+        # a hard error so n8n alerts a human — the run must not report success
+        # when the audit trail is incomplete.
         cert_path_actual: Path | None = None
         cert_tracking: str | None = None
-        cert_capture_error: str | None = None
         letter_id = (result["docupost"] or {}).get("letterId")
         if letter_id:
             web_user, web_pass = _load_docupost_web_creds()
             if not (web_user and web_pass):
-                cert_capture_error = "no_docupost_web_creds"
-                log("Docupost cert skipped: DOCUPOST_WEB_USER/PASS not set (env or Cardentials.txt).")
-            else:
-                try:
-                    cert_path_actual, cert_tracking = capture_docupost_certification(
-                        browser=browser,
-                        letter_id=letter_id,
-                        out_dir=out_dir,
-                        web_user=web_user,
-                        web_pass=web_pass,
-                    )
-                    if not (cert_path_actual and cert_path_actual.exists()):
-                        cert_capture_error = "screenshot_failed"
-                except Exception as e:
-                    cert_capture_error = f"{type(e).__name__}: {e}"
-                    log(f"Docupost cert capture crashed: {e}")
+                raise RuntimeError(
+                    "Docupost letter was mailed but cert screenshot cannot be "
+                    "captured: DOCUPOST_WEB_USER/PASS not set (env or "
+                    "Cardentials.txt). Resolve creds and resume manually."
+                )
+            cert_path_actual, cert_tracking = capture_docupost_certification(
+                browser=browser,
+                letter_id=letter_id,
+                out_dir=out_dir,
+                web_user=web_user,
+                web_pass=web_pass,
+            )
+            if not (cert_path_actual and cert_path_actual.exists()):
+                raise RuntimeError(
+                    f"Docupost letter {letter_id} was mailed but the "
+                    "certification screenshot was not saved. Resolve manually."
+                )
 
         # ------- Step 3: API-upload merged PDF (HARD-FAIL) -------
         # Merged PDF must be in ResMan Documents so residents/staff can
@@ -2312,20 +2338,19 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             merged_doc_id = resp.get("documentId")
             result["docs"]["combinedPdfDocumentId"] = merged_doc_id
 
-        # ------- Step 4: API-upload cert PNG (SOFT-FAIL) -------
+        # ------- Step 4: API-upload cert PNG (HARD-FAIL) -------
         cert_uploaded = False
-        cert_upload_error = cert_capture_error
         cert_doc_id: str | None = None
-        if cert_path_actual and cert_path_actual.exists() and oid and property_id:
-            try:
-                resp = upload_document_via_api(
-                    cert_path_actual, object_id=oid, property_id=property_id,
+        if cert_path_actual and cert_path_actual.exists():
+            if not oid or not property_id:
+                raise RuntimeError(
+                    f"Cannot API-upload cert PNG: missing oid={oid!r} or propertyId={property_id!r}"
                 )
-                cert_uploaded = True
-                cert_doc_id = resp.get("documentId")
-            except Exception as e:
-                cert_upload_error = f"upload_failed: {type(e).__name__}: {e}"
-                log(f"Cert PNG API upload failed (continuing): {e}")
+            resp = upload_document_via_api(
+                cert_path_actual, object_id=oid, property_id=property_id,
+            )
+            cert_uploaded = True
+            cert_doc_id = resp.get("documentId")
 
         result["docupost"] = {
             **(result["docupost"] or {}),
@@ -2334,7 +2359,7 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                 "path":       str(cert_path_actual) if cert_uploaded and cert_path_actual else None,
                 "documentId": cert_doc_id,
                 "tracking":   cert_tracking,
-                "error":      cert_upload_error,
+                "error":      None,
             },
         }
 
@@ -2365,13 +2390,29 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
             result["email"]["sent"] = True
 
             # ------- Step 6: Verify via Communication Log -------
+            # Three-step retry (10s → 15s → 20s) because ResMan's Kendo grid
+            # lazy-hydrates after the accordion opens and can run past 15s
+            # on a slow backend. If all three retries miss, the email cannot
+            # be confirmed as having left ResMan and we raise — the old
+            # 'sent_no_email' status silently reported success-with-caveat
+            # which is exactly what we're hunting down.
             subject_hint = result["email"]["subject"] or prop_name
             comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=10)
             if not comm["verified"]:
                 log("Comm Log verify miss; retrying with longer wait.")
                 comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=15)
+            if not comm["verified"]:
+                log("Comm Log verify miss; final retry at 20s.")
+                comm = verify_via_comm_log(page, lease_url, subject_hint, wait_seconds=20)
             result["email"]["commLogVerified"] = comm["verified"]
             result["email"]["commLogRow"] = comm["row"]
+            if not comm["verified"]:
+                raise RuntimeError(
+                    "Email was clicked Send but could not be confirmed in the "
+                    "Communication Log after three retries (10s/15s/20s). "
+                    "Resident may or may not have received the message — "
+                    "verify manually in ResMan before resuming."
+                )
         else:
             log("Email skipped (either --no-send or email.enabled=false).")
 
@@ -2381,11 +2422,7 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
     if not result["email"]["sent"]:
         result["status"] = "parked" if not email_enabled else "sent_no_email"
     else:
-        # commLogVerified is None when verification wasn't run (email disabled)
-        # or True/False when it did run. Treat False as "we clicked Send but
-        # cannot confirm the message left ResMan" — same category as
-        # sent_no_email so downstream (n8n summary email) flags it.
-        result["status"] = "sent" if result["email"]["commLogVerified"] is not False else "sent_no_email"
+        result["status"] = "sent"
     result["endedAt"] = now_iso()
     result["durationSeconds"] = int(time.time() - started)
     return result
