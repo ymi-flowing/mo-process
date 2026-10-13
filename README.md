@@ -20,7 +20,7 @@ Login → open Move Out Rec → fill date + charges → capture totals → appro
       → Comm Log verify (Kendo grid lazy-hydrate — waits up to 25s)
 ```
 
-**Typical run**: 4-5 min in CI. Biggest single wait is the Docupost tracking-number poll (up to 3 min; screenshot fires anyway on timeout).
+**Typical run**: 4-5 min in CI. Biggest single wait is the Docupost tracking-number poll (up to 10 min; run hard-fails if tracking # never appears so n8n alerts a human).
 
 ## Result JSON — what n8n gets back
 
@@ -221,10 +221,10 @@ Gotchas learned the hard way:
 1. Opens `https://app.docupost.com/letter/<letter_id>` in a fresh browser context.
 2. Logs in with `DOCUPOST_WEB_USER` / `DOCUPOST_WEB_PASS`.
 3. Waits for the letter page (`Delivery Status` text).
-4. Polls up to **180s** for `USPS Tracking # <digits>` to appear in the body (Docupost can take 30-180s to publish tracking after sendletter).
+4. Polls up to **600s (10 min)** for `USPS Tracking # <digits>` to appear in the body. Docupost's "Preparing" stage can run several minutes before the letter transitions to "On the way" with a tracking #. The old 180s cap silently timed out on slow queues (incident: run 38419865425, 2026-10-13).
 5. Screenshots the smallest `.bubble-element.Group` containing "Delivery Status" + "Recipient" + "Sender" — that's Bubble.io's middle-content column. Falls back to viewport screenshot if the panel selector misses.
 6. Saves as `out/MO Docs - Mail Certification.png`.
-7. Returns `(path, tracking_number)` — either may be `None` on soft failure.
+7. Returns `(path, tracking_number)` — either may be `None` on soft failure. **The caller hard-fails if `tracking_number` is None** so n8n alerts a human; the screenshot alone is not a valid audit trail.
 
 ## Privacy tradeoff
 

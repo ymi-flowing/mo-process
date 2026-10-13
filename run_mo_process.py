@@ -1653,13 +1653,19 @@ def capture_docupost_certification(
     out_dir: Path,
     web_user: str,
     web_pass: str,
-    poll_seconds: int = 180,
+    poll_seconds: int = 600,
 ) -> tuple[Path | None, str | None]:
     """Log into the Docupost dashboard, open the letter, wait for the USPS
     tracking # to render, and screenshot the middle panel (delivery status +
     order summary + recipient + sender) to `out_dir/MO Docs - Mail
     Certification.png`. Returns (path, tracking_number) — either may be None
-    on soft failure. NEVER raises; callers log and move on."""
+    on soft failure. NEVER raises; callers log and move on.
+
+    Default poll is 600s (10 min): Docupost's "Preparing" stage can run
+    several minutes before the letter transitions to "On the way" with a
+    tracking #. Prior 180s cap silently timed out on slow queues (run
+    38419865425, 2026-10-13 — screenshot showed status still "Processing /
+    Preparing" at 180s). Caller enforces hard-fail when tracking is None."""
     from playwright.sync_api import Error as PWError
     cert_path = out_dir / CERT_FILENAME
     context = browser.new_context(viewport={"width": 1400, "height": 1200})
@@ -2315,6 +2321,21 @@ def run(payload: dict, send: bool, headless: bool, resume: bool = False) -> dict
                 raise RuntimeError(
                     f"Docupost letter {letter_id} was mailed but the "
                     "certification screenshot was not saved. Resolve manually."
+                )
+            # The screenshot alone is NOT a valid audit trail — if Docupost
+            # was still in 'Preparing' when the poll window closed, the PNG
+            # shows no tracking # and n8n would otherwise report success
+            # silently. Hard-fail so a human reruns once Docupost has moved
+            # the letter to 'On the way'. See `capture_docupost_certification`
+            # docstring for the 2026-10-13 incident this guards against.
+            if not cert_tracking:
+                raise RuntimeError(
+                    f"Docupost letter {letter_id} was mailed but no USPS "
+                    f"tracking # appeared on the dashboard within the poll "
+                    f"window. The letter is likely still in 'Preparing' on "
+                    f"Docupost's side — check "
+                    f"https://app.docupost.com/letter/{letter_id} and resume "
+                    f"this run once tracking is visible."
                 )
 
         # ------- Step 3: API-upload merged PDF (HARD-FAIL) -------
