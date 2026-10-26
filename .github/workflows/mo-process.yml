@@ -39,8 +39,21 @@ jobs:
 
       - name: Install LibreOffice (for docx→PDF)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          # Try install directly first — ubuntu-latest ships with reasonably
+          # fresh apt lists. If that fails, retry with `apt-get update`,
+          # each attempt timeout-boxed so a slow mirror can't eat the job.
+          install_lo() {
+            sudo apt-get install -y --no-install-recommends libreoffice-writer
+          }
+          update_apt() {
+            for i in 1 2 3; do
+              timeout 180 sudo apt-get update && return 0
+              echo "apt-get update attempt $i failed; sleeping 10s"
+              sleep 10
+            done
+            return 1
+          }
+          install_lo || { update_apt && install_lo; }
 
       - name: Install deps
         run: |

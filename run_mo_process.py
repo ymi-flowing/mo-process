@@ -450,39 +450,46 @@ def open_move_out_rec(page: Page, lease_url: str, known_property_names: list | N
     # OpenLink appears first in DOM (comma-list selectors grab it) and its
     # data-href only carries personID — no proid/oid. Link carries params in
     # `href` (post-approval) OR `data-href` (pre-approval); read either.
-    signals = page.evaluate(
+    #
+    # Everything (read + click) happens in ONE evaluate so the sidebar
+    # cannot re-render between reading the attributes and triggering the
+    # click — that race crashed run 40351242619.
+    result = page.evaluate(
         r"""(known) => {
-          const out = { proid: null, nameMatches: [] };
           const a = document.querySelector('#MoveOutReconciliationLink');
-          if (a) {
-            const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
-            const m = href.match(/proid=([0-9a-fA-F-]{36})/);
-            if (m) out.proid = m[1];
-          }
+          if (!a) return { ok: false };
+          const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
+          const proidMatch = href.match(/proid=([0-9a-fA-F-]{36})/);
+          const oidMatch   = href.match(/[?&]oid=([0-9a-fA-F-]{36})/);
+          const nameMatches = [];
           const text = document.body.innerText || '';
           for (const name of (known || [])) {
-            if (name && text.includes(name)) out.nameMatches.push(name);
+            if (name && text.includes(name)) nameMatches.push(name);
           }
-          return out;
+          window.jQuery(a).trigger('click');
+          return {
+            ok: true,
+            dataHref: href,
+            oid: oidMatch ? oidMatch[1] : null,
+            proid: proidMatch ? proidMatch[1] : null,
+            nameMatches,
+          };
         }""",
         known_property_names or [],
     )
-
-    info = page.evaluate(
-        r"""() => {
-          const a = document.querySelector('#MoveOutReconciliationLink');
-          const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
-          window.jQuery(a).trigger('click');
-          // Extract 'oid' (BillingAccountId) — ResMan Partner API's
-          // POST /Documents needs it as `Id` when type=Lease.
-          const oidMatch = href.match(/[?&]oid=([0-9a-fA-F-]{36})/);
-          return {
-            dataHref: href,
-            oid: oidMatch ? oidMatch[1] : null,
-          };
-        }"""
-    )
-    info['propertySignals'] = signals
+    if not result.get("ok"):
+        raise RuntimeError(
+            "#MoveOutReconciliationLink disappeared from the sidebar between "
+            "wait_for_function and evaluate — SPA likely re-rendered the sidebar."
+        )
+    info = {
+        "dataHref": result["dataHref"],
+        "oid": result["oid"],
+        "propertySignals": {
+            "proid": result["proid"],
+            "nameMatches": result["nameMatches"],
+        },
+    }
     # Wait for the MOR page to render its Move-out rec. date input.
     page.wait_for_function(
         "() => !!document.getElementById('MoveOutReconciliationDate')",
